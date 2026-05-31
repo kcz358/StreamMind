@@ -51,9 +51,11 @@ class StreamOneVision(nn.Module):
         if need_h:
             h = out.hidden_states[-1]                              # [B, T, H]
             b_idx = torch.arange(h.size(0), device=h.device)
-            g_logits = self.gate(h[b_idx, gate_pos].float())       # [B, 2]
+            g_logits = self.gate(h[b_idx, gate_pos])               # [B, 2]
             gate_loss = F.cross_entropy(
-                g_logits, gate_label, weight=self._gate_w.to(g_logits.device)
+                g_logits.float(),
+                gate_label,
+                weight=self._gate_w.to(device=g_logits.device, dtype=torch.float32),
             )
             loss = gate_loss if loss is None else loss + gate_loss
 
