@@ -44,12 +44,14 @@
 
 ## File Structure
 
+All new code lives in a dedicated top-level package `ov_train/` to avoid the legacy `streammind/` import chain (broken under transformers 5.x: `streammind/__init__.py` → `streammind/model/multimodal_projector/builder.py` imports the removed `TRANSFORMERS_CACHE` symbol; `data/datasets.py` needs `Levenshtein`). Do NOT touch any file under `streammind/` or `data/`.
+
 | Path | Status | Responsibility |
 |---|---|---|
-| `streammind/model/onevision_stream.py` | NEW | `StreamOneVision` wrapper + gate head; pure model code, no training logic |
-| `data/codec_utils.py` | NEW | `extract_subclip(src_video, t_start, dur, out_path)` — ffmpeg subprocess, idempotent |
-| `data/soccer_onevision.py` | NEW | `SoccerOneVisionDataset` + collator; reads MatchTime captions, calls processor for both backends |
-| `streammind/train_onevision.py` | NEW | Train entry: HF `Trainer`, args, model build, freeze logic |
+| `ov_train/onevision_stream.py` | DONE | `StreamOneVision` wrapper + gate head |
+| `ov_train/codec_utils.py` | NEW | `extract_subclip(src_video, t_start, dur, out_path)` — ffmpeg subprocess, idempotent |
+| `ov_train/soccer_dataset.py` | NEW | `SoccerOneVisionDataset` + collator; reads MatchTime captions, calls processor for both backends |
+| `ov_train/train.py` | NEW | Train entry: HF `Trainer`, args, model build, freeze logic |
 | `scripts/finetune_ov_stage1_frames.sh` | NEW | Single-GPU 10-step smoke, frames backend |
 | `scripts/finetune_ov_stage1_codec.sh` | NEW | Single-GPU 10-step smoke, codec backend |
 
