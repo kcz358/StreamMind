@@ -57,7 +57,7 @@ class StreamOneVision(nn.Module):
                 gate_label,
                 weight=self._gate_w.to(device=g_logits.device, dtype=torch.float32),
             )
-            loss = gate_loss if loss is None else loss + gate_loss
+            loss = gate_loss if (loss is None or torch.isnan(loss)) else loss + gate_loss
 
         return CausalLMOutputWithPast(
             loss=loss,
