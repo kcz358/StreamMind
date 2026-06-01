@@ -8,7 +8,7 @@
 #              ov-stream:latest \
 #              bash scripts/finetune_ov_stage1_frames.sh
 
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -19,13 +19,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # ---- System deps ----
 # ffmpeg 4.4+ required by codec backend (Ubuntu 22.04 ships 4.4.x)
+# python3.12 from deadsnakes PPA (jammy default is 3.10)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-dev python3.12-venv python3-pip \
-        ffmpeg git wget ca-certificates build-essential \
+        software-properties-common gnupg ca-certificates \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv \
+        ffmpeg git wget build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
     ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
+    wget -qO /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py && \
+    python /tmp/get-pip.py && rm /tmp/get-pip.py && \
     python -m pip install --upgrade pip
 
 # ---- Torch 2.9 stack ----
@@ -44,10 +50,10 @@ RUN pip install \
 # pip's tmp dir lives on a different filesystem than ~/.cache/pip/wheels (the
 # wheel move fails with "Invalid cross-device link"). Pull the exact wheel
 # directly to avoid that.
-RUN wget -q -O /tmp/flash_attn.whl \
-        https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
-    && pip install /tmp/flash_attn.whl \
-    && rm /tmp/flash_attn.whl
+RUN cd /tmp && \
+    wget -q https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+    && pip install flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+    && rm flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 
 # ---- Codec video backend ----
 RUN pip install codec-video-prep==0.2.5 opencv-python==4.11.0.86
