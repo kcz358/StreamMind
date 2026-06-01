@@ -1,0 +1,12 @@
+# Build artifacts / caches we never want copied into the image
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.git/
+docs/
+output/
+logs/
+*.log
+# Big data (mount at runtime instead)
+data/MatchTime/
