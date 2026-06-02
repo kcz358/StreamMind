@@ -23,7 +23,9 @@ from torch.utils.data import Dataset
 
 from ov_train.codec_utils import extract_subclip
 
-DATA_ROOT = Path("/data/v-kaichen/azure_blob/data/MatchTime")
+DATA_ROOT = Path(
+    os.environ.get("MATCHTIME_ROOT", "/data/v-kaichen/azure_blob/data/MatchTime")
+)
 CAPTION_ROOT = DATA_ROOT / "dataset" / "MatchTime"
 VIDEO_ROOT = DATA_ROOT / "features_video"
 CLIP_CACHE = DATA_ROOT / "clips"
