@@ -191,6 +191,21 @@ class SoccerOneVisionDataset(Dataset):
 
     # ------------------------------------------------------------------
     def __getitem__(self, i):
+        # Some clips trigger cv-preinfer "no canvases produced" (too-short
+        # keyframe seek) or decord decode errors. Skip the offending sample
+        # and try the next one; the entire training shouldn't die over a
+        # handful of bad clips.
+        n = len(self.samples)
+        for attempt in range(n):
+            idx = (i + attempt) % n
+            try:
+                return self._get_one(idx)
+            except Exception as e:
+                if attempt == 0:
+                    print(f"[dataset] skip idx={idx}: {type(e).__name__}: {e}", flush=True)
+        raise RuntimeError("no usable sample after full scan")
+
+    def _get_one(self, i):
         s = self.samples[i]
 
         if self.stage == 1:
