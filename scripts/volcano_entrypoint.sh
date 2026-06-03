@@ -108,7 +108,7 @@ torchrun \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS:-500}" \
     --save_total_limit 5 \
-    --report_to "${WANDB_API_KEY:+wandb}${WANDB_API_KEY:-none}" \
+    --report_to "${REPORT_TO}" \
     --run_name "${WANDB_NAME:-}" \
     --dataloader_num_workers 2 \
     --remove_unused_columns False \
