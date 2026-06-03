@@ -87,6 +87,11 @@ else
   REPORT_TO=none
 fi
 
+RESUME_FLAG=()
+if [[ -n "${RESUME_FROM:-}" ]]; then
+  RESUME_FLAG=(--resume_from "${RESUME_FROM}")
+fi
+
 torchrun \
   --nproc_per_node "${GPUS_PER_NODE}" \
   --nnodes "${NNODES}" \
@@ -95,6 +100,7 @@ torchrun \
   --master_port "${MASTER_PORT}" \
   ov_train/train.py \
     --stage "${STAGE}" \
+    "${RESUME_FLAG[@]}" \
     --video_backend "${VIDEO_BACKEND}" \
     --num_frames "${NUM_FRAMES:-16}" \
     --split "${SPLIT:-train}" \

@@ -38,6 +38,7 @@ class DataArgs:
 @dataclass
 class StageArgs:
     stage: int = 1  # 1 = train LLM, 2 = train gate
+    resume_from: str | None = None  # path to stage1 checkpoint dir (containing model.safetensors)
 
 
 def apply_stage_freeze(model: StreamOneVision, stage: int):
@@ -65,6 +66,15 @@ def main():
         model_args.model_name_or_path, trust_remote_code=True
     )
     model = StreamOneVision(model_args.model_name_or_path)
+
+    if stage_args.resume_from:
+        from safetensors.torch import load_file
+        ckpt_path = os.path.join(stage_args.resume_from, "model.safetensors")
+        state = load_file(ckpt_path)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[resume] loaded {len(state)} tensors from {ckpt_path}; "
+              f"missing={len(missing)} unexpected={len(unexpected)}")
+
     apply_stage_freeze(model, stage_args.stage)
 
     if training_args.gradient_checkpointing:
