@@ -81,6 +81,12 @@ echo "DEEPSPEED_CFG  = ${DEEPSPEED_CONFIG}"
 echo "rank ${NODE_RANK}/${NNODES}  master=${MASTER_ADDR}:${MASTER_PORT}  gpus=${GPUS_PER_NODE}"
 echo "=================================================="
 
+if [[ -n "${WANDB_API_KEY:-}" && "${WANDB_API_KEY}" != "none" ]]; then
+  REPORT_TO=wandb
+else
+  REPORT_TO=none
+fi
+
 torchrun \
   --nproc_per_node "${GPUS_PER_NODE}" \
   --nnodes "${NNODES}" \
