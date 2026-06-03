@@ -43,7 +43,8 @@ RUN pip install \
         "accelerate==1.*" \
         deepspeed==0.19.1 \
         decord==0.6.0 \
-        pillow sentencepiece timm numpy==1.26.4
+        pillow sentencepiece timm numpy==1.26.4 \
+        wandb
 
 # ---- flash-attn 2.8.3 prebuilt wheel ----
 # `pip install flash-attn==2.8.3` can fall back to source build on systems where
