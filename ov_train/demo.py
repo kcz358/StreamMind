@@ -187,8 +187,10 @@ def main():
         with torch.no_grad():
             out = model.base(**inputs, output_hidden_states=True, return_dict=True)
             h = out.hidden_states[-1]
-            g_logits = model.gate(h[torch.arange(h.size(0), device=device), gate_pos])
-            probs = F.softmax(g_logits.float(), dim=-1).squeeze(0).tolist()
+            g_in = h[torch.arange(h.size(0), device=device), gate_pos]
+            # gate is fp32; base hidden is bf16
+            g_logits = model.gate(g_in.float())
+            probs = F.softmax(g_logits, dim=-1).squeeze(0).tolist()
 
         respond_prob = probs[1]
         if respond_prob >= args.gate_thresh:
