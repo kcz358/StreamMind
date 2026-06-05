@@ -12,10 +12,13 @@ from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
     has_length,
-    ALL_LAYERNORM_LAYERS,
     logger,
     TRAINER_STATE_NAME,
 )
+try:
+    from transformers.trainer import ALL_LAYERNORM_LAYERS
+except ImportError:  # transformers >= 5.x moved this symbol
+    from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 # from transformers.trainer import (
 #     is_sagemaker_mp_enabled,

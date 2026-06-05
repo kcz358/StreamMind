@@ -21,7 +21,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.regnet import RegStage
 from timm.models.layers import LayerNorm, LayerNorm2d
-from transformers import TRANSFORMERS_CACHE
+try:
+    from transformers import TRANSFORMERS_CACHE
+except ImportError:  # transformers >= 4.46 removed this constant
+    from huggingface_hub import constants as _hf_constants
+    TRANSFORMERS_CACHE = _hf_constants.HF_HUB_CACHE
 from dataclasses import dataclass
 from .ssm import VideoMamba
 
