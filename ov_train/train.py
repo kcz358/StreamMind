@@ -82,17 +82,15 @@ class ModelArguments:
     )
     mm_projector_type: str = field(default="mamba")
     freeze_backbone: bool = field(default=False)
-    soccer_dataset_train_llm: bool = field(default=False)
-    soccer_dataset_train_cls: bool = field(default=False)
 
 
-def apply_freeze(model: OneVisionStreamForCausalLM, model_args: ModelArguments) -> None:
-    if model_args.soccer_dataset_train_cls:
+def apply_freeze(model: OneVisionStreamForCausalLM, model_args: ModelArguments, data_args: "DataArguments") -> None:
+    if data_args.soccer_dataset_train_cls:
         model.requires_grad_(False)
         for name, param in model.get_model().mm_projector.named_parameters():
             if "cls" in name:
                 param.requires_grad = True
-    elif model_args.soccer_dataset_train_llm:
+    elif data_args.soccer_dataset_train_llm:
         for name, param in model.get_model().mm_projector.named_parameters():
             if "cls" in name:
                 param.requires_grad = False
@@ -129,11 +127,10 @@ def main() -> None:
     data_args.video_processor = image_processor
     data_args.image_processor = image_processor
     data_args.is_multimodal = True
-    data_args.soccer_dataset_train_llm = model_args.soccer_dataset_train_llm
 
     model = OneVisionStreamForCausalLM(model_args.model_name_or_path)
     model.add_streammind_special_tokens(tokenizer)
-    apply_freeze(model, model_args)
+    apply_freeze(model, model_args, data_args)
 
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})

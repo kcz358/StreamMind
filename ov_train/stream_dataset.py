@@ -68,6 +68,7 @@ class DataArguments:
     live_dataset:bool = False
     ego4d_lta_dataset:bool = False
     soccer_dataset_train_llm: bool = False
+    soccer_dataset_train_cls: bool = False
     video_backend: str = "frames"
 
 import tqdm
