@@ -11,18 +11,23 @@ import sys
 from dataclasses import dataclass, field
 
 import torch
-from transformers import AutoProcessor, AutoTokenizer, HfArgumentParser
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    HfArgumentParser,
+    PreTrainedTokenizer,
+)
+from transformers import TrainingArguments as _HFTrainingArguments
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Ported verbatim from streammind/train_new_stream.py:564-587 and 105-130 to
 # avoid circular-import issues when ``streammind`` is half-loaded.
-import transformers
 from typing import Optional, Sequence, Dict, Union, Any
 
 
 @dataclass
-class TrainingArguments(transformers.TrainingArguments):
+class TrainingArguments(_HFTrainingArguments):
     optim: str = field(default="adamw_torch")
     mm_projector_lr: Optional[float] = None
     freeze_mm_mlp_adapter: bool = field(default=False)
@@ -43,7 +48,7 @@ class TrainingArguments(transformers.TrainingArguments):
 
 @dataclass
 class DataCollatorForstreamDataset(object):
-    tokenizer: transformers.PreTrainedTokenizer
+    tokenizer: PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, Any]:
         instance = instances[0]
