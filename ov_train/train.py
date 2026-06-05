@@ -71,7 +71,7 @@ class DataCollatorForstreamDataset(object):
 
 from streammind.streammind_trainer_score import StreamMindTrainer
 
-from ov_train.datasets import LazySupervisedDataset, DataArguments
+from ov_train.stream_dataset import LazySupervisedDataset, DataArguments
 from ov_train.onevision_stream import OneVisionStreamForCausalLM
 
 
