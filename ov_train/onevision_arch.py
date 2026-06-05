@@ -241,15 +241,9 @@ class OneVisionStreamMetaForCausalLM(ABC):
 
 
     def encode_images_or_videos_score_cls_video_cls_autoregressive(self, images_or_videos,cls_inference = False,cls_training = False,caption_info = None,prompt_time_input_ids = None,prompt_time_lable = None):
-        import os as _os, time as _time
-        _dbg = _os.environ.get("OV_DBG_TIMING", "0") == "1"
-        _t0 = _time.time()
         frames_features_list = []
         frames_features_shape = []
-        if _dbg:
-            print(f"[ov_dbg] encode_segs={len(images_or_videos)} rank={_os.environ.get('LOCAL_RANK','?')}", flush=True)
         for idx, images_or_video in enumerate(images_or_videos):
-            _ti = _time.time()
             if isinstance(images_or_video, dict):
                 # codec path: dict already encodes its own time dimension
                 frames_features = self._encode_frames_with_onevision(images_or_video)
@@ -259,8 +253,6 @@ class OneVisionStreamMetaForCausalLM(ABC):
                 frames_features = self._encode_frames_with_onevision(videos, max_frames=600)
             frames_features_list.append(frames_features)
             frames_features_shape.append(frames_features.shape[1])
-            if _dbg and (idx < 3 or idx == len(images_or_videos)-1):
-                print(f"[ov_dbg] seg{idx}: shape={tuple(frames_features.shape)} took={_time.time()-_ti:.2f}s", flush=True)
 
         frames_features_shape = list(accumulate(frames_features_shape))
 
