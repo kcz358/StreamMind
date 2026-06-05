@@ -146,14 +146,16 @@ class OneVisionStreamMetaForCausalLM(ABC):
             with ctx:
                 vout = vision_tower(pv, grid_thw=thw, patch_positions=pp)
             embeds = vout.last_hidden_state if hasattr(vout, "last_hidden_state") else vout[0]
-            # thw[i] = (t_i, h_i, w_i); total canvases T = sum(t_i); after merge,
-            # patches per canvas = h_i*w_i / merge_size**2. For our single-batch case
-            # there is exactly one row.
-            assert thw.size(0) == 1, "codec path currently assumes one video at a time"
-            T = int(thw[0, 0].item())
             merge = vision_tower.config.spatial_merge_size
+            # thw rows describe each codec group: (t_i, h_i, w_i). After spatial
+            # merging, each canvas yields (h_i//merge)*(w_i//merge) tokens. The
+            # downstream temporal aggregator expects [B=1, T, n_per, hidden]; we
+            # assume all groups share the same canvas shape (true for fixed
+            # codec_config), so we sum T across rows and use the first row's
+            # spatial dim.
+            T_total = int(thw[:, 0].sum().item())
             n_per = int((thw[0, 1].item() // merge) * (thw[0, 2].item() // merge))
-            return embeds.reshape(1, T, n_per, -1)
+            return embeds.reshape(1, T_total, n_per, -1)
 
         # --- frames path (original) ---
         assert videos.dim() == 5, f"Expected [B, T, C, H, W], got {tuple(videos.shape)}"
