@@ -426,6 +426,11 @@ class StreamMindTrainer(Trainer):
         return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
+        # tf 5.x removed the `metrics` positional arg from Trainer._save_checkpoint.
+        # Only forward it if the parent still accepts it.
+        import inspect
+        _parent_sig = inspect.signature(super(StreamMindTrainer, self)._save_checkpoint)
+        _parent_accepts_metrics = "metrics" in _parent_sig.parameters
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
@@ -467,9 +472,15 @@ class StreamMindTrainer(Trainer):
                     torch.save(non_lora_state_dict, os.path.join(output_dir, 'non_lora_trainables.bin'))
 
                 # save for acquring lora adapter parameters & trainer states: `adapter_config.json`, `adapter_model.safetensors`
-                super(StreamMindTrainer, self)._save_checkpoint(model, trial, metrics)
+                if _parent_accepts_metrics:
+                    super(StreamMindTrainer, self)._save_checkpoint(model, trial, metrics)
+                else:
+                    super(StreamMindTrainer, self)._save_checkpoint(model, trial)
             else:
-                super(StreamMindTrainer, self)._save_checkpoint(model, trial, metrics)
+                if _parent_accepts_metrics:
+                    super(StreamMindTrainer, self)._save_checkpoint(model, trial, metrics)
+                else:
+                    super(StreamMindTrainer, self)._save_checkpoint(model, trial)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
