@@ -15,10 +15,55 @@ from transformers import AutoProcessor, AutoTokenizer, HfArgumentParser
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from streammind.train_new_stream import (
-    DataCollatorForstreamDataset,
-    TrainingArguments,
-)
+# Ported verbatim from streammind/train_new_stream.py:564-587 and 105-130 to
+# avoid circular-import issues when ``streammind`` is half-loaded.
+import transformers
+from typing import Optional, Sequence, Dict, Union, Any
+
+
+@dataclass
+class TrainingArguments(transformers.TrainingArguments):
+    optim: str = field(default="adamw_torch")
+    mm_projector_lr: Optional[float] = None
+    freeze_mm_mlp_adapter: bool = field(default=False)
+    remove_unused_columns: bool = field(default=False)
+    cache_dir: Optional[str] = field(default=None)
+    group_by_modality_length: bool = field(default=False)
+    model_max_length: int = field(default=512)
+    double_quant: bool = field(default=True)
+    quant_type: str = field(default="nf4")
+    bits: int = field(default=16)
+    lora_enable: bool = field(default=False)
+    lora_r: int = 64
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    lora_weight_path: str = ""
+    lora_bias: str = "none"
+
+
+@dataclass
+class DataCollatorForstreamDataset(object):
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, Any]:
+        instance = instances[0]
+        batch = dict()
+        batch["timestamp"] = instance["timestamp"]
+        batch["labels"] = instance["labels"]
+        batch["input_ids"] = instance["input_ids"]
+        batch["caption_info"] = instance["caption_info"]
+        batch["video_path"] = instance["video_path"]
+        if "image" in instance.keys():
+            batch["images"] = [instance["image"], ["image"]]
+        else:
+            batch["images"] = [instance["video"], ["video"]]
+        batch["attention_mask"] = None
+        batch["past_review_caption"] = instance["past_review_caption"]
+        batch["data_type"] = instance["data_type"]
+        batch["model_type"] = instance["model_type"]
+        return batch
+
+
 from streammind.streammind_trainer_score import StreamMindTrainer
 
 from ov_train.datasets import LazySupervisedDataset, DataArguments
