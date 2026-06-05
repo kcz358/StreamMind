@@ -64,7 +64,21 @@ class DataCollatorForstreamDataset(object):
         return batch
 
 
-from streammind.streammind_trainer_score import StreamMindTrainer
+from streammind.streammind_trainer_score import StreamMindTrainer as _StreamMindTrainer
+
+# Smoke / debug fallback: HF Trainer is enough for paper-faithful pipeline.
+# Set USE_STREAMMIND_TRAINER=1 to opt in to the original 1200-line trainer
+# (needed only if mm_projector_lr / group_by_modality_length / lora_enable
+# are actually used).
+if os.environ.get("USE_STREAMMIND_TRAINER") == "1":
+    StreamMindTrainer = _StreamMindTrainer
+else:
+    from transformers import Trainer
+
+    class StreamMindTrainer(Trainer):
+        def __init__(self, *args, data_args=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.data_args = data_args
 
 from ov_train.datasets import LazySupervisedDataset, DataArguments
 from ov_train.onevision_stream import OneVisionStreamForCausalLM
