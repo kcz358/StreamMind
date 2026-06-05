@@ -2,7 +2,8 @@
 
 Builds a Causal LM whose backbone is the LLaVA-OneVision-2 model
 (``model.visual`` + ``model.language_model``) and whose multimodal
-projector is StreamMind's ``Video_Mamba_seq`` (EPFE Mamba + ClsNet).
+projector is the Qwen3-based ``Video_Mamba_seq`` from ``ov_train.projector``
+(EPFE Mamba + Qwen3 ClsNet).
 We deliberately avoid the original LLaVA-style ``initialize_vision_modules``
 plumbing — OV2 ships its own vision tower and we wrap it directly.
 """
@@ -17,7 +18,7 @@ from transformers import AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ov_train.onevision_arch import OneVisionStreamMetaForCausalLM
-from streammind.model.multimodal_projector.builder import Video_Mamba_seq
+from ov_train.projector import Video_Mamba_seq
 
 
 class _ProjectorConfig:
@@ -30,7 +31,7 @@ class _ProjectorConfig:
 
 
 class _InnerModel(nn.Module):
-    """Holds OV2's visual tower + Qwen3 LM trunk + StreamMind's Mamba projector.
+    """Holds the full OV2 model + StreamMind's Mamba projector.
 
     ``OneVisionStreamMetaForCausalLM`` expects::
 
@@ -38,16 +39,28 @@ class _InnerModel(nn.Module):
         this.get_vision_tower() -> the vision tower
         this.mm_projector       -> the Mamba+ClsNet projector
         this.embed_tokens(ids)  -> token embeddings (delegates to Qwen3)
+
+    We keep the full ``ov_model`` as a single submodule and expose its
+    ``visual`` / ``language_model`` / ``lm_head`` via properties so that
+    ``resize_token_embeddings`` (which replaces ``lm_head`` with a new
+    ``Linear``) never leaves us with stale references.
     """
 
     def __init__(self, ov_model, mm_projector: nn.Module):
         super().__init__()
-        self._vision_tower = ov_model.model.visual
-        self.language_model = ov_model.model.language_model
+        self.ov_model = ov_model
         self.mm_projector = mm_projector
 
+    @property
+    def language_model(self):
+        return self.ov_model.model.language_model
+
+    @property
+    def lm_head(self):
+        return self.ov_model.lm_head
+
     def get_vision_tower(self):
-        return self._vision_tower
+        return self.ov_model.model.visual
 
     def embed_tokens(self, input_ids: torch.LongTensor) -> torch.Tensor:
         return self.language_model.get_input_embeddings()(input_ids)
@@ -103,7 +116,6 @@ class OneVisionStreamForCausalLM(nn.Module, OneVisionStreamMetaForCausalLM):
         self.config.mm_hidden_size = mm_hidden_size
 
         self.model = _InnerModel(ov_model, mm_projector)
-        self.lm_head = ov_model.lm_head
         self.vocab_size = self.config.text_config.vocab_size
 
         self.train_iteration = 0
@@ -119,11 +131,49 @@ class OneVisionStreamForCausalLM(nn.Module, OneVisionStreamMetaForCausalLM):
     def get_model(self) -> _InnerModel:
         return self.model
 
+    @property
+    def lm_head(self) -> nn.Linear:
+        return self.model.ov_model.lm_head
+
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
 
     def get_output_embeddings(self):
         return self.lm_head
+
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        """Resize OV2's embedding + ``lm_head`` to fit ``new_num_tokens``.
+
+        Only grows, never truncates: OV2 ships with embeddings padded to 151936
+        while the tokenizer only has 151665 in-use slots, so requesting a small
+        ``new_num_tokens`` would otherwise discard valid weights.
+        """
+        cur = self.model.ov_model.get_input_embeddings().weight.shape[0]
+        target = max(cur, new_num_tokens)
+        if target != cur:
+            self.model.ov_model.resize_token_embeddings(target)
+            self.vocab_size = target
+            self.config.text_config.vocab_size = target
+        return self.model.ov_model.get_input_embeddings()
+
+    def add_streammind_special_tokens(self, tokenizer) -> Tuple[int, int]:
+        """Register StreamMind's ``</silence>`` / ``</response>`` tokens.
+
+        Adds the two markers to ``tokenizer`` (as additional special tokens),
+        resizes the OV2 embedding / ``lm_head`` to cover them, and stores
+        the resulting ids on ``self.model.mm_projector`` so the Qwen3 ClsNet
+        slices ``prompt_time_lable`` by the correct ids instead of the
+        Mistral-era 32000/32001 defaults. Returns ``(silence_id, response_id)``.
+        """
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": ["</silence>", "</response>"]}
+        )
+        self.resize_token_embeddings(len(tokenizer))
+        silence_id = tokenizer.convert_tokens_to_ids("</silence>")
+        response_id = tokenizer.convert_tokens_to_ids("</response>")
+        self.model.mm_projector.silence_token_id = silence_id
+        self.model.mm_projector.response_token_id = response_id
+        return silence_id, response_id
 
     @property
     def device(self) -> torch.device:
