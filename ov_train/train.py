@@ -82,6 +82,10 @@ class ModelArguments:
     )
     mm_projector_type: str = field(default="mamba")
     freeze_backbone: bool = field(default=False)
+    init_from_ckpt: str = field(
+        default="",
+        metadata={"help": "Path to a stage-1 checkpoint directory; loads weights but resets optim/lr (use instead of --resume_from_checkpoint when you want a fresh stage-2 init)."},
+    )
 
 
 def apply_freeze(model: OneVisionStreamForCausalLM, model_args: ModelArguments, data_args: "DataArguments") -> None:
@@ -131,6 +135,21 @@ def main() -> None:
 
     model = OneVisionStreamForCausalLM(model_args.model_name_or_path)
     model.add_streammind_special_tokens(tokenizer)
+
+    if model_args.init_from_ckpt:
+        import os
+        import safetensors.torch as st
+        ckpt_path = os.path.join(model_args.init_from_ckpt, "model.safetensors")
+        sd = st.load_file(ckpt_path)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            print(f"[init_from_ckpt] {ckpt_path}")
+            print(f"  loaded={len(sd) - len(unexpected)}  missing={len(missing)}  unexpected={len(unexpected)}")
+            if missing[:3]:
+                print(f"  missing[:3]={missing[:3]}")
+            if unexpected[:3]:
+                print(f"  unexpected[:3]={unexpected[:3]}")
+
     apply_freeze(model, model_args, data_args)
 
     if training_args.gradient_checkpointing:
