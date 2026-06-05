@@ -142,6 +142,12 @@ class OneVisionStreamMetaForCausalLM(ABC):
         assert videos.dim() == 5, f"Expected [B, T, C, H, W], got {tuple(videos.shape)}"
         B, T, C, H, W = videos.shape
 
+        vision_tower = self.get_model().get_vision_tower()
+        # Move to the vision tower's device + dtype (dataset returns CPU tensors).
+        target_device = next(vision_tower.parameters()).device
+        target_dtype = next(vision_tower.parameters()).dtype
+        videos = videos.to(device=target_device, dtype=target_dtype)
+
         if max_frames is not None and B * T > max_frames:
             if B != 1:
                 raise ValueError(
@@ -151,7 +157,6 @@ class OneVisionStreamMetaForCausalLM(ABC):
             videos = videos.reshape(B * T, C, H, W)[-max_frames:].unsqueeze(0)
             T = max_frames
 
-        vision_tower = self.get_model().get_vision_tower()
         vis_cfg = vision_tower.config
         patch_size = vis_cfg.patch_size
         merge_size = vis_cfg.spatial_merge_size
