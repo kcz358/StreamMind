@@ -238,7 +238,11 @@ class Video_Mamba_seq(nn.Module):
                 # cls_label = torch.nn.utils.rnn.pad_sequence(cls_labels,batch_first=True,padding_value=IGNORE_INDEX)
 
                 #mask
-                cls_attention_mask = input_embed.ne(pad_token_id)
+                # tf 5.x masking_utils expects 2-D attention_mask [B, T]; the
+                # original code used element-wise .ne(pad) on the 3-D embed which
+                # produced [B, T, D] and tf 4.x silently coerced. Collapse the
+                # hidden dim with .any() to recover [B, T].
+                cls_attention_mask = input_embed.ne(pad_token_id).any(dim=-1)
 
                 if cls_training:
                     cls_output= self.cls_net(input_embed,cls_labels=cls_label,cls_attention_mask=cls_attention_mask)
@@ -285,7 +289,11 @@ class Video_Mamba_seq(nn.Module):
                 # cls_label = torch.nn.utils.rnn.pad_sequence(cls_labels,batch_first=True,padding_value=IGNORE_INDEX)
 
                 #mask
-                cls_attention_mask = input_embed.ne(pad_token_id)
+                # tf 5.x masking_utils expects 2-D attention_mask [B, T]; the
+                # original code used element-wise .ne(pad) on the 3-D embed which
+                # produced [B, T, D] and tf 4.x silently coerced. Collapse the
+                # hidden dim with .any() to recover [B, T].
+                cls_attention_mask = input_embed.ne(pad_token_id).any(dim=-1)
 
                 if cls_training:
                     cls_output= self.cls_net(input_embed,cls_labels=cls_label,cls_attention_mask=cls_attention_mask)
@@ -302,7 +310,7 @@ class Video_Mamba_seq(nn.Module):
             # start_feature_idx = [0] + frames_features_shape[:-1]
             input_embeds.append(x[0][-1].unsqueeze(0))
             input_embed = torch.nn.utils.rnn.pad_sequence(input_embeds,batch_first=True,padding_value=pad_token_id)
-            cls_attention_mask = input_embed.ne(pad_token_id)
+            cls_attention_mask = input_embed.ne(pad_token_id).any(dim=-1)
 
             # start = time.time()
             cls_output = self.cls_net(input_embed, cls_labels = None, cls_attention_mask = cls_attention_mask)
