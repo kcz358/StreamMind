@@ -326,7 +326,9 @@ class StreamMindTrainer(Trainer):
         self.data_args = data_args        
         video_processor = self.data_args.video_processor
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+    def _get_train_sampler(self, train_dataset=None) -> Optional[torch.utils.data.Sampler]:
+        # transformers 4.x: no arg; transformers >=5.x: passes the dataset.
+        # Keep our original behavior of inspecting self.train_dataset.
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
 
@@ -339,7 +341,10 @@ class StreamMindTrainer(Trainer):
                 group_by_modality=True,
             )
         else:
-            return super()._get_train_sampler()
+            try:
+                return super()._get_train_sampler(train_dataset)
+            except TypeError:
+                return super()._get_train_sampler()
 
     def create_optimizer(self):
         """
