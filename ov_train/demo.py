@@ -65,6 +65,8 @@ def parse_args():
     p.add_argument("--clip_cache", default="/tmp/demo_clips")
     p.add_argument("--codec_cache", default="/tmp/demo_codec_cache")
     p.add_argument("--output_video", default=None, help="if set, burn subtitles into mp4")
+    p.add_argument("--audit_only", action="store_true",
+                   help="skip generation; just dump gate probs over time + AUC vs GT")
     return p.parse_args()
 
 
@@ -156,6 +158,7 @@ def main():
     )
 
     events: list[tuple[float, str]] = []
+    gate_trace: list[tuple[float, float]] = []  # (t, respond_prob)
     t = args.t_start + args.window
     while t <= args.t_end:
         clip = Path(args.clip_cache) / f"demo_t{int(t * 100):08d}.mp4"
@@ -193,7 +196,10 @@ def main():
             probs = F.softmax(g_logits, dim=-1).squeeze(0).tolist()
 
         respond_prob = probs[1]
-        if respond_prob >= args.gate_thresh:
+        gate_trace.append((t, respond_prob))
+        if args.audit_only:
+            print(f"[t={t:7.2f}s gate={respond_prob:.4f}]", flush=True)
+        elif respond_prob >= args.gate_thresh:
             with torch.no_grad():
                 gen = model.base.generate(
                     **inputs,
@@ -215,6 +221,25 @@ def main():
         for t, text in gts:
             if args.t_start <= t <= args.t_end:
                 print(f"  GT [t={t:7.2f}s] {text}")
+
+    if gate_trace:
+        import numpy as np
+        probs = np.array([p for _, p in gate_trace])
+        ts = np.array([t for t, _ in gate_trace])
+        print(f"\n[audit] gate prob stats: min={probs.min():.4f} mean={probs.mean():.4f} "
+              f"max={probs.max():.4f} std={probs.std():.4f}")
+        # Mark each step as positive (within ±gap of any GT) or negative
+        gap = 3.0
+        gt_ts = np.array([t for t, _ in gts if args.t_start <= t <= args.t_end])
+        if len(gt_ts) > 0:
+            is_pos = np.array([(np.abs(gt_ts - t).min() <= gap) for t in ts])
+            print(f"[audit] within ±{gap}s of GT caption: {is_pos.sum()}/{len(ts)} steps")
+            if is_pos.any() and (~is_pos).any():
+                p_pos = probs[is_pos]
+                p_neg = probs[~is_pos]
+                print(f"[audit]   positive steps gate: mean={p_pos.mean():.4f} max={p_pos.max():.4f}")
+                print(f"[audit]   negative steps gate: mean={p_neg.mean():.4f} max={p_neg.max():.4f}")
+                print(f"[audit]   separation: pos_mean - neg_mean = {p_pos.mean() - p_neg.mean():+.4f}")
 
     # Optional subtitle burn-in
     if args.output_video and events:
