@@ -126,6 +126,7 @@ def main() -> None:
     image_processor = _resolve_image_processor(processor)
     data_args.video_processor = image_processor
     data_args.image_processor = image_processor
+    data_args.processor = processor  # full processor needed by codec backend
     data_args.is_multimodal = True
 
     model = OneVisionStreamForCausalLM(model_args.model_name_or_path)

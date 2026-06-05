@@ -117,35 +117,47 @@ class OneVisionStreamMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def _encode_frames_with_onevision(self, videos, max_frames=None):
-        """Encode ``[B, T, 3, H, W]`` frames using OneVision's Qwen2VL-style vision tower.
+        """Encode frames using OneVision's Qwen2VL-style vision tower.
 
-        Replaces the CLIP-style ``vision_tower(frames)`` call from the original
-        StreamMind / Videollama2 code. Builds the flattened-patch ``pixel_values``,
-        ``grid_thw`` and ``patch_positions`` tensors the OneVision vision tower
-        expects, then reshapes the merged output back to ``[B, T, n_patches, hidden]``
-        so the rest of the splice / projector pipeline is unchanged.
+        Two input modes:
+          - **frames-mode** (default): ``videos`` is ``[B, T, 3, H, W]`` float tensor.
+            We flatten patches ourselves, build grid_thw / patch_positions, and call
+            the vision tower in chunks.
+          - **codec-mode**: ``videos`` is a ``dict`` produced by the OneVision codec
+            processor with keys ``pixel_values, image_grid_thw, patch_positions``.
+            We just forward them as-is; the canvases play the role of "frames" for
+            EPFE (T_canvas time steps), each carrying its own ``patch_positions``
+            metadata so the ViT rotary embeddings still align with real (t,h,w).
 
-        Assumes ``videos`` are already resized and normalised by the dataset:
-        ``H`` and ``W`` must each be divisible by ``patch_size * spatial_merge_size``.
-
-        Args:
-            videos: ``[B, T, 3, H, W]`` float tensor.
-            max_frames: optional cap on the flattened frame count, applied as
-                ``frames[-max_frames:]`` to match the original CLIP-path
-                truncation. Only valid for ``B == 1``.
-
-        Returns:
-            Tensor of shape ``[B, T, n_patches_per_frame, hidden]`` where
-            ``n_patches_per_frame == (H // patch_size // merge_size) * (W // patch_size // merge_size)``
-            and ``hidden == vision_tower.config.out_hidden_size``.
+        Returns: ``[B=1, T, n_patches_per_canvas, hidden]`` ready for the temporal
+        aggregator (Mamba EPFE).
         """
-        assert videos.dim() == 5, f"Expected [B, T, C, H, W], got {tuple(videos.shape)}"
-        B, T, C, H, W = videos.shape
-
         vision_tower = self.get_model().get_vision_tower()
-        # Move to the vision tower's device + dtype (dataset returns CPU tensors).
         target_device = next(vision_tower.parameters()).device
         target_dtype = next(vision_tower.parameters()).dtype
+        vt_trainable = any(p.requires_grad for p in vision_tower.parameters())
+
+        # --- codec path: dict with already-flattened pixel_values + thw + pp ---
+        if isinstance(videos, dict):
+            pv = videos["pixel_values"].to(device=target_device, dtype=target_dtype)
+            thw = videos["image_grid_thw"].to(device=target_device)
+            pp = videos["patch_positions"].to(device=target_device)
+            ctx = torch.enable_grad() if vt_trainable else torch.no_grad()
+            with ctx:
+                vout = vision_tower(pv, grid_thw=thw, patch_positions=pp)
+            embeds = vout.last_hidden_state if hasattr(vout, "last_hidden_state") else vout[0]
+            # thw[i] = (t_i, h_i, w_i); total canvases T = sum(t_i); after merge,
+            # patches per canvas = h_i*w_i / merge_size**2. For our single-batch case
+            # there is exactly one row.
+            assert thw.size(0) == 1, "codec path currently assumes one video at a time"
+            T = int(thw[0, 0].item())
+            merge = vision_tower.config.spatial_merge_size
+            n_per = int((thw[0, 1].item() // merge) * (thw[0, 2].item() // merge))
+            return embeds.reshape(1, T, n_per, -1)
+
+        # --- frames path (original) ---
+        assert videos.dim() == 5, f"Expected [B, T, C, H, W], got {tuple(videos.shape)}"
+        B, T, C, H, W = videos.shape
         videos = videos.to(device=target_device, dtype=target_dtype)
 
         if max_frames is not None and B * T > max_frames:
@@ -182,7 +194,6 @@ class OneVisionStreamMetaForCausalLM(ABC):
         # is frozen during training — we wrap the chunked forward in torch.no_grad()
         # to avoid keeping per-frame activations alive for backprop.
         chunk_size = int(os.environ.get("OV_VISION_CHUNK", "32"))
-        vt_trainable = any(p.requires_grad for p in vision_tower.parameters())
         all_embeds = []
         ctx = torch.enable_grad() if vt_trainable else torch.no_grad()
         with ctx:
@@ -231,15 +242,13 @@ class OneVisionStreamMetaForCausalLM(ABC):
         frames_features_list = []
         frames_features_shape = []
         for idx, images_or_video in enumerate(images_or_videos):
-            num_frames = images_or_video.shape[0]
-            videos = images_or_video.unsqueeze(0)
-            # import pdb
-            # pdb.set_trace()
-            assert len(videos.size()) == 5
-            batch_size = videos.size(0)
-            # import pdb
-            # pdb.set_trace()
-            frames_features = self._encode_frames_with_onevision(videos, max_frames=600)
+            if isinstance(images_or_video, dict):
+                # codec path: dict already encodes its own time dimension
+                frames_features = self._encode_frames_with_onevision(images_or_video)
+            else:
+                videos = images_or_video.unsqueeze(0)
+                assert len(videos.size()) == 5
+                frames_features = self._encode_frames_with_onevision(videos, max_frames=600)
             frames_features_list.append(frames_features)
             frames_features_shape.append(frames_features.shape[1])
 

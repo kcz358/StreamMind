@@ -701,7 +701,53 @@ class LazySupervisedDataset(Dataset):
         we'd pad with ``processor.image_mean * 255``.
         """
         if video_backend == "codec":
-            raise NotImplementedError("codec backend not wired into the paper-faithful pipeline yet")
+            # Cut [start, end] subclip via ffmpeg (idempotent on disk), then run
+            # the full OneVision processor in codec mode to get the canvas-packed
+            # pixel_values + image_grid_thw + patch_positions. We return a dict;
+            # _encode_frames_with_onevision detects it and forwards everything
+            # straight to the vision tower (preserving the patch_positions that
+            # encode real (t,h,w) for the rotary embeddings).
+            from ov_train.codec_utils import extract_subclip
+            ov_proc = getattr(self.data_args, "processor", None)
+            if ov_proc is None:
+                raise RuntimeError("codec backend requires data_args.processor (full OneVision processor)")
+            clip_cache_root = os.environ.get(
+                "STREAMMIND_CLIP_CACHE",
+                os.path.join(os.environ.get("MATCHTIME_ROOT", "/tmp"), "clips"),
+            )
+            os.environ.setdefault(
+                "ONLINE_CODEC_CACHE_DIR",
+                os.path.join(os.environ.get("MATCHTIME_ROOT", "/tmp"), "codec_cache"),
+            )
+            duration = max(0.0, float(end_timestamp) - float(start_timestamp))
+            if duration <= 0:
+                return None
+            # Unique clip key per (game, start_ms, dur_ms) so concurrent workers
+            # don't clobber each other.
+            game_key = os.path.relpath(video_path, os.environ.get("MATCHTIME_ROOT", "/")).replace("/", "__")
+            clip_path = os.path.join(
+                clip_cache_root,
+                f"{game_key}__t{int(start_timestamp * 100):08d}__d{int(duration * 100):08d}.mp4",
+            )
+            try:
+                extract_subclip(video_path, float(start_timestamp), duration, clip_path)
+            except Exception:
+                return None
+            try:
+                enc = ov_proc(
+                    text=["<video>"],
+                    videos=[clip_path],
+                    video_backend="codec",
+                    return_tensors="pt",
+                    padding=False,
+                )
+            except Exception:
+                return None
+            return {
+                "pixel_values": enc["pixel_values"],
+                "image_grid_thw": enc["image_grid_thw"],
+                "patch_positions": enc["patch_positions"],
+            }
 
         def get_index(end_frame, video_fps, max_frame, cur_fps, first_idx=0, start_frame=0):
             seg_size = max(1, int(video_fps / cur_fps))
