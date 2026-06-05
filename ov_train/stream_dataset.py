@@ -839,7 +839,9 @@ class LazySupervisedDataset(Dataset):
                     start_timestamp = start_timestamp[:idx]
                     caption = caption[:idx]
                     break
-                if idx>0:
+                if idx > 0 and not isinstance(video, dict):
+                    # frames mode: drop the first frame which overlaps with the
+                    # previous segment's last frame. codec mode has no such overlap.
                     video = video[1:]
                 video_list.append(video)
             assert len(video_list) == len(timestamp), "Length of data error "
@@ -873,7 +875,7 @@ class LazySupervisedDataset(Dataset):
                 if video is None:
                     i = random.randint(0,len(self.ego4d_video_list) - 1)
                     return self.__getitem__(i)
-                if idx>0:
+                if idx > 0 and not isinstance(video, dict):
                     video = video[1:]
                 video_list.append(video)
             data_dict["video"] = video_list
