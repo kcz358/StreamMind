@@ -118,6 +118,12 @@ class OneVisionStreamForCausalLM(nn.Module, OneVisionStreamMetaForCausalLM):
         self.model = _InnerModel(ov_model, mm_projector)
         self.vocab_size = self.config.text_config.vocab_size
 
+        # Freeze the vision tower by default (matches the original StreamMind /
+        # VideoLLaMA2 design where CLIP is always frozen). EPFE helper relies on
+        # this to skip activation storage during forward.
+        for p in self.model.get_vision_tower().parameters():
+            p.requires_grad = False
+
         self.train_iteration = 0
         self.frame_feature = None
         self.past_review_caption = None

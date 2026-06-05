@@ -178,30 +178,36 @@ class OneVisionStreamMetaForCausalLM(ABC):
         # spatial; temporal information is carried by per-frame timestamp tags").
         # We chunk frames to avoid OOM on long sequences: each chunk is one forward
         # with grid_thw=[chunk_size, h, w], outputs are concatenated.
+        # Following the original StreamMind / VideoLLaMA2 design, the vision tower
+        # is frozen during training — we wrap the chunked forward in torch.no_grad()
+        # to avoid keeping per-frame activations alive for backprop.
         chunk_size = int(os.environ.get("OV_VISION_CHUNK", "32"))
+        vt_trainable = any(p.requires_grad for p in vision_tower.parameters())
         all_embeds = []
-        for i in range(0, B * T, chunk_size):
-            chunk_frames = frames[i : i + chunk_size]
-            cT = chunk_frames.size(0)
+        ctx = torch.enable_grad() if vt_trainable else torch.no_grad()
+        with ctx:
+            for i in range(0, B * T, chunk_size):
+                chunk_frames = frames[i : i + chunk_size]
+                cT = chunk_frames.size(0)
 
-            patches = chunk_frames.reshape(cT, C, h_m, merge_size, patch_size, w_m, merge_size, patch_size)
-            patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7).contiguous()
-            pixel_values = patches.reshape(-1, C * patch_size * patch_size)
+                patches = chunk_frames.reshape(cT, C, h_m, merge_size, patch_size, w_m, merge_size, patch_size)
+                patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7).contiguous()
+                pixel_values = patches.reshape(-1, C * patch_size * patch_size)
 
-            device = pixel_values.device
-            grid_thw = torch.tensor([[cT, grid_h, grid_w]], dtype=torch.long, device=device)
+                device = pixel_values.device
+                grid_thw = torch.tensor([[cT, grid_h, grid_w]], dtype=torch.long, device=device)
 
-            total = cT * grid_h * grid_w
-            block_idx = torch.arange(total, device=device).view(cT, h_m, merge_size, w_m, merge_size)
-            block_idx = block_idx.permute(0, 1, 3, 2, 4).contiguous().view(total)
-            t_co = torch.arange(cT, device=device, dtype=torch.int64).repeat_interleave(grid_h * grid_w)
-            h_co = torch.arange(grid_h, device=device, dtype=torch.int64).repeat_interleave(grid_w).repeat(cT)
-            w_co = torch.arange(grid_w, device=device, dtype=torch.int64).repeat(grid_h).repeat(cT)
-            pp = torch.stack([t_co, h_co, w_co], dim=1)[block_idx]
+                total = cT * grid_h * grid_w
+                block_idx = torch.arange(total, device=device).view(cT, h_m, merge_size, w_m, merge_size)
+                block_idx = block_idx.permute(0, 1, 3, 2, 4).contiguous().view(total)
+                t_co = torch.arange(cT, device=device, dtype=torch.int64).repeat_interleave(grid_h * grid_w)
+                h_co = torch.arange(grid_h, device=device, dtype=torch.int64).repeat_interleave(grid_w).repeat(cT)
+                w_co = torch.arange(grid_w, device=device, dtype=torch.int64).repeat(grid_h).repeat(cT)
+                pp = torch.stack([t_co, h_co, w_co], dim=1)[block_idx]
 
-            vout = vision_tower(pixel_values, grid_thw=grid_thw, patch_positions=pp)
-            cembeds = vout.last_hidden_state if hasattr(vout, "last_hidden_state") else vout[0]
-            all_embeds.append(cembeds)
+                vout = vision_tower(pixel_values, grid_thw=grid_thw, patch_positions=pp)
+                cembeds = vout.last_hidden_state if hasattr(vout, "last_hidden_state") else vout[0]
+                all_embeds.append(cembeds)
 
         embeds = torch.cat(all_embeds, dim=0)  # [B*T*n_patches_per_frame, hidden]
         embeds = embeds.reshape(B, T, n_patches_per_frame, -1)
