@@ -1,8 +1,8 @@
-# ov_train/train.py
-"""Two-stage trainer for OneVision-based StreamMind.
+"""Train entry for OneVision-2 + StreamMind paper-faithful pipeline.
 
-Stage 1: train base CausalLM on caption generation; gate frozen.
-Stage 2: freeze base, train only the gate head on silence/response labels.
+Drop-in replacement for ``streammind.train_new_stream``: uses the same
+``DataCollatorForstreamDataset`` + ``StreamMindTrainer``, but the model is
+``OneVisionStreamForCausalLM`` (OV2 backbone + Mamba EPFE + Qwen3 ClsNet).
 """
 from __future__ import annotations
 
@@ -11,93 +11,97 @@ import sys
 from dataclasses import dataclass, field
 
 import torch
-from transformers import AutoProcessor, HfArgumentParser, Trainer, TrainingArguments
+from transformers import AutoProcessor, AutoTokenizer, HfArgumentParser
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ov_train.onevision_stream import StreamOneVision
-from ov_train.soccer_dataset import OneVisionCollator, SoccerOneVisionDataset
+from streammind.train_new_stream import (
+    DataCollatorForstreamDataset,
+    TrainingArguments,
+)
+from streammind.streammind_trainer_score import StreamMindTrainer
+
+from ov_train.datasets import LazySupervisedDataset, DataArguments
+from ov_train.onevision_stream import OneVisionStreamForCausalLM
 
 
 @dataclass
-class ModelArgs:
+class ModelArguments:
     model_name_or_path: str = field(
-        default="/data/v-kaichen/azure_blob/pretrained_models/huggingface/LLaVA-OneVision-2-8B-Instruct"
+        default="/data/kaichen/LLaVA-OneVision-1.5-RL/pretrained/LLaVA-OneVision-2-8B-Instruct"
     )
+    mm_projector_type: str = field(default="mamba")
+    freeze_backbone: bool = field(default=False)
+    soccer_dataset_train_llm: bool = field(default=False)
+    soccer_dataset_train_cls: bool = field(default=False)
 
 
-@dataclass
-class DataArgs:
-    split: str = "train"
-    video_backend: str = "frames"  # "frames" or "codec"
-    num_frames: int = 16
-    window_seconds: float = 8.0
-    max_samples: int | None = None
-
-
-@dataclass
-class StageArgs:
-    stage: int = 1  # 1 = train LLM, 2 = train gate
-    resume_from: str | None = None  # path to stage1 checkpoint dir (containing model.safetensors)
-
-
-def apply_stage_freeze(model: StreamOneVision, stage: int):
-    if stage == 1:
-        for p in model.gate.parameters():
-            p.requires_grad = False
-    elif stage == 2:
-        for p in model.base.parameters():
-            p.requires_grad = False
-        for p in model.gate.parameters():
-            p.requires_grad = True
-    else:
-        raise ValueError(f"unknown stage {stage}")
+def apply_freeze(model: OneVisionStreamForCausalLM, model_args: ModelArguments) -> None:
+    if model_args.soccer_dataset_train_cls:
+        model.requires_grad_(False)
+        for name, param in model.get_model().mm_projector.named_parameters():
+            if "cls" in name:
+                param.requires_grad = True
+    elif model_args.soccer_dataset_train_llm:
+        for name, param in model.get_model().mm_projector.named_parameters():
+            if "cls" in name:
+                param.requires_grad = False
+        if model_args.freeze_backbone:
+            model.get_model().language_model.requires_grad_(False)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"[stage {stage}] trainable {trainable/1e6:.1f}M / total {total/1e9:.2f}B")
+    print(f"[freeze] trainable {trainable/1e6:.1f}M / total {total/1e9:.2f}B", flush=True)
 
 
-def main():
-    parser = HfArgumentParser((ModelArgs, DataArgs, StageArgs, TrainingArguments))
-    model_args, data_args, stage_args, training_args = parser.parse_args_into_dataclasses()
-
-    processor = AutoProcessor.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=True
+def _resolve_image_processor(processor):
+    """OneVision's ``AutoProcessor`` exposes its image processor differently
+    across releases; pick the first attribute that carries ``image_mean``."""
+    for attr in ("image_processor", "video_processor"):
+        candidate = getattr(processor, attr, None)
+        if candidate is not None and hasattr(candidate, "image_mean"):
+            return candidate
+    if hasattr(processor, "image_mean"):
+        return processor
+    raise AttributeError(
+        "Could not locate an image_processor with image_mean on the OneVision processor."
     )
-    model = StreamOneVision(model_args.model_name_or_path)
 
-    if stage_args.resume_from:
-        from safetensors.torch import load_file
-        ckpt_path = os.path.join(stage_args.resume_from, "model.safetensors")
-        state = load_file(ckpt_path)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[resume] loaded {len(state)} tensors from {ckpt_path}; "
-              f"missing={len(missing)} unexpected={len(unexpected)}")
 
-    apply_stage_freeze(model, stage_args.stage)
+def main() -> None:
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+
+    image_processor = _resolve_image_processor(processor)
+    data_args.video_processor = image_processor
+    data_args.image_processor = image_processor
+    data_args.is_multimodal = True
+    data_args.soccer_dataset_train_llm = model_args.soccer_dataset_train_llm
+
+    model = OneVisionStreamForCausalLM(model_args.model_name_or_path)
+    model.add_streammind_special_tokens(tokenizer)
+    apply_freeze(model, model_args)
 
     if training_args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    train_ds = SoccerOneVisionDataset(
-        processor,
-        split=data_args.split,
-        video_backend=data_args.video_backend,
-        num_frames=data_args.num_frames,
-        window_seconds=data_args.window_seconds,
-        max_samples=data_args.max_samples,
-        stage=stage_args.stage,
+    train_dataset = LazySupervisedDataset(
+        data_path=data_args.data_path or "",
+        tokenizer=tokenizer,
+        data_args=data_args,
     )
-    collator = OneVisionCollator(pad_token_id=processor.tokenizer.pad_token_id or 0)
+    collator = DataCollatorForstreamDataset(tokenizer=tokenizer)
 
-    trainer = Trainer(
+    trainer = StreamMindTrainer(
+        data_args,
         model=model,
         args=training_args,
-        train_dataset=train_ds,
+        train_dataset=train_dataset,
         data_collator=collator,
+        processing_class=tokenizer,
     )
     trainer.train()
 
