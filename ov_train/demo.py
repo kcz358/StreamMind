@@ -148,14 +148,6 @@ def main():
         else:
             n_response += 1
             print(f"[t={t:6.1f}] cls=1 p_sil={cls_probs[0]:.3f} p_resp={cls_probs[1]:.3f}")
-                with torch.no_grad():
-                    out_ids = model.model.language_model.generate(
-                        inputs_embeds=inputs_embeds,
-                        max_new_tokens=64,
-                        do_sample=False,
-                    )
-                text = tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
-                print(f"[t={t:6.1f}] cls=1 RESP: {text}")
 
         # GT alignment: print any GT caption that lies in [t, t+step)
         for (g_t, g_txt) in gt_list:
