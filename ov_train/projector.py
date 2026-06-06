@@ -305,16 +305,43 @@ class Video_Mamba_seq(nn.Module):
                     return cls_output,cls_label
 
         if cls_demo:
+            # Match the Path-B training distribution exactly: for the new
+            # segment's frames, build [frame_0, eos_emb, frame_1, eos_emb, ...,
+            # frame_{N-1}, cap_emb] then einops (b t) c -> b t c with t=2.
+            # The ClsNet was trained at position-1 (target slot) to predict
+            # 0=silence for all but the last pair, 1=response for the last.
+            # At inference we want the *last pair's* position-1 logit, which is
+            # the model's prediction for the just-seen frame.
             pad_token_id = 0
-            input_embeds = []
-            # start_feature_idx = [0] + frames_features_shape[:-1]
-            input_embeds.append(x[0][-1].unsqueeze(0))
-            input_embed = torch.nn.utils.rnn.pad_sequence(input_embeds,batch_first=True,padding_value=pad_token_id)
+            if not frames_features_shape:
+                cur_frame_feature = x[0]
+            else:
+                cur_frame_feature = x[0][frames_features_shape[-1]:]
+
+            eos_target = self.cls_net.cls_model.model.embed_tokens(
+                torch.tensor([0]).to(x.device)
+            )
+            caption_target = self.cls_net.cls_model.model.embed_tokens(
+                torch.tensor([1]).to(x.device)
+            )
+
+            if cur_frame_feature.shape[0] > 1:
+                # frame_0 eos frame_1 eos ... frame_{N-2} eos frame_{N-1} cap
+                pairs = torch.cat(
+                    [torch.cat([frame.unsqueeze(0), eos_target]) for frame in cur_frame_feature[:-1]]
+                )
+                input_embeds = torch.cat([pairs, cur_frame_feature[-1].unsqueeze(0), caption_target])
+            else:
+                input_embeds = torch.cat([cur_frame_feature, caption_target])
+
+            input_embed = einops.rearrange(input_embeds, "(b t) c -> b t c", t=2)
             cls_attention_mask = input_embed.ne(pad_token_id).any(dim=-1)
-
-            # start = time.time()
-            cls_output = self.cls_net(input_embed, cls_labels = None, cls_attention_mask = cls_attention_mask)
-
-            return x , cls_output.logits[0][-1]
+            cls_output = self.cls_net(
+                input_embed, cls_labels=None, cls_attention_mask=cls_attention_mask
+            )
+            # logits shape [B', 2, vocab=2]; the last batch entry's position-1
+            # logit is what corresponds to the final frame's caption-target slot
+            # (i.e. the model's silence-vs-response decision for this window).
+            return x, cls_output.logits[-1, -1]
 
         return x

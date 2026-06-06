@@ -125,12 +125,18 @@ def main():
             continue
 
         with torch.no_grad():
-            # Direct encoder-side audit: bypass prepare_inputs* and call the
-            # encode helper that the inference_demo path uses internally. This
-            # gives us the raw cls_feature softmax without the LLM splice.
+            # Mimic Path-B (cls_training) input format at inference time so the
+            # ClsNet sees the same distribution it was trained on. For one
+            # window of N canvas features, build:
+            #   [frame_0, eos_emb, frame_1, eos_emb, ..., frame_{N-1}, cap_emb]
+            # then einops "(b t) c -> b t c" t=2. Return logits at position 1
+            # (target slot) for the last batch entry (which corresponds to the
+            # final frame paired with caption_target).
             past_frames = getattr(model, "_demo_past_frames", None)
             interval_id_list = getattr(model, "_demo_interval_ids", [])
-            X_features, cls_feature, new_frames, interval_id = (
+
+            # Run vision tower + Mamba EPFE on the new clip
+            X_features, cls_logits_at_caption, new_frames, interval_id = (
                 model.encode_images_or_videos_score_cls_inference_allframe_demo(
                     codec_dict, past_frames, frames_features_shape=interval_id_list
                 )
@@ -139,7 +145,9 @@ def main():
             interval_id_list.append(interval_id)
             model._demo_interval_ids = interval_id_list
 
-            cls_probs = torch.softmax(cls_feature.float().flatten(), dim=-1).tolist()
+            # cls_logits_at_caption is logits at the cap_emb position (vocab=2)
+            # The Mamba projector returns the cls_demo path's logits[0][-1].
+            cls_probs = torch.softmax(cls_logits_at_caption.float().flatten(), dim=-1).tolist()
             cls_pred_int = int(torch.tensor(cls_probs).argmax().item())
 
         if cls_pred_int == 0:
