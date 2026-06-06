@@ -1,86 +1,71 @@
-"""Audit-only streaming demo for paper-faithful StreamMind OneVision.
+"""Paper-faithful audit demo for StreamMind OneVision.
 
-For a single MatchTime half, slide an 8-second window every `--step` seconds.
-At every step:
-  1. ffmpeg extract subclip → codec backend → ViT → Mamba EPFE → ClsNet
-  2. Print [t_start, p_silence, p_response, predicted_class]
-  3. If predicted_class == 1 (response), call base LLM .generate() to emit a one-line caption
+This script mirrors the paper's `eval_type=cls` evaluation path in
+`streammind/eval/inference_video_ego4d_stream_parallel_new.py`:
 
-This is the paper's `stream_generate_demo` path:
-  prepare_inputs_labels_for_multimodal_score_stream_inference_demo
-    -> encode_images_or_videos_score_cls_inference_allframe_demo  (ViT + Mamba + ClsNet)
-    -> if cls_pred == 1: super().generate(inputs_embeds=...)
+  1. Build LazySupervisedDataset with soccer_dataset_train_cls=True (same as
+     training).
+  2. Forward one half through the model with cls_inference=True (paper Path-B,
+     same distribution as cls_training).
+  3. Extract logits at the target slots (cls_label != IGNORE_INDEX) and
+     argmax to get per-segment silence/response predictions.
+  4. Compare to ground-truth cls_label and print accuracy.
 
-Run inside the dev pod:
+Run inside the dev pod (single GPU is enough):
   python -m ov_train.demo \\
     --resume_from /data/kaichen/StreamMind/paper_stage2_codec_.../checkpoint-94 \\
-    --video       /data/kaichen/data/MatchTime/features_video/.../1_224p.mkv \\
-    --captions    /data/kaichen/data/MatchTime/dataset/MatchTime/valid/.../Labels-caption.json \\
-    --half 1 --t_start 0 --t_end 300 --step 2
+    --max_halves 1
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
+from torch.utils.data import DataLoader
 from transformers import AutoProcessor, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ov_train.codec_utils import extract_subclip
+from streammind.constants import IGNORE_INDEX
 from ov_train.onevision_stream import OneVisionStreamForCausalLM
+from ov_train.stream_dataset import (
+    DataArguments,
+    LazySupervisedDataset,
+)
+from ov_train.train import DataCollatorForstreamDataset, _resolve_image_processor
 
 
-# ---------------------------------------------------------------- args
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_path", default="/data/kaichen/LLaVA-OneVision-1.5-RL/pretrained/LLaVA-OneVision-2-8B-Instruct")
     p.add_argument("--resume_from", required=True, help="stage2 checkpoint dir")
-    p.add_argument("--video", required=True, help="full game-half mkv")
-    p.add_argument("--captions", default=None, help="optional Labels-caption.json for ground-truth overlay")
-    p.add_argument("--half", type=int, default=1, help="which half (1 or 2) to filter captions by")
-    p.add_argument("--t_start", type=float, default=0.0)
-    p.add_argument("--t_end", type=float, default=300.0)
-    p.add_argument("--step", type=float, default=2.0, help="sliding stride in seconds")
-    p.add_argument("--window", type=float, default=8.0, help="window length in seconds")
-    p.add_argument("--audit_only", action="store_true", help="skip LLM generate, only print gate")
-    p.add_argument("--clip_cache", default="/tmp/demo_clips")
+    p.add_argument("--data_type", default="valid", help="train|valid")
+    p.add_argument("--max_halves", type=int, default=1)
     return p.parse_args()
-
-
-def _parse_gt(captions_path: str, half: int):
-    """Return list of (t_sec, text) for ground-truth captions in given half."""
-    if not captions_path:
-        return []
-    data = json.load(open(captions_path))
-    gts = []
-    for ann in data.get("annotations", []):
-        gameTime = ann.get("gameTime", "")
-        try:
-            h_str, mmss = gameTime.split(" - ")
-            h = int(h_str.strip().split(" ")[0])
-            if h != half:
-                continue
-            m, s = mmss.strip().split(":")
-            t = int(m) * 60 + int(s)
-        except Exception:
-            continue
-        gts.append((t, ann.get("anonymized", ann.get("description", ""))))
-    return sorted(gts)
 
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    os.makedirs(args.clip_cache, exist_ok=True)
+    device = "cuda"
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+    image_processor = _resolve_image_processor(processor)
+
+    data_args = DataArguments()
+    data_args.soccer_dataset = True
+    data_args.soccer_dataset_train_cls = True
+    data_args.soccer_dataset_train_llm = False
+    data_args.video_backend = "codec"
+    data_args.data_type = args.data_type
+    data_args.video_processor = image_processor
+    data_args.image_processor = image_processor
+    data_args.processor = processor
+    data_args.is_multimodal = True
+    data_args.cur_fps = 2
 
     print(f"[demo] loading base model: {args.model_path}")
     model = OneVisionStreamForCausalLM(args.model_path)
@@ -93,78 +78,87 @@ def main():
 
     model = model.to(device=device, dtype=torch.bfloat16).eval()
 
-    # silence / response token ids (set on the Mamba projector during init)
     silence_id = model.model.mm_projector.silence_token_id
     response_id = model.model.mm_projector.response_token_id
     print(f"[demo] silence_id={silence_id} response_id={response_id}")
 
-    gt_list = _parse_gt(args.captions, args.half)
-    print(f"[demo] ground-truth captions in half {args.half}: {len(gt_list)}")
+    dataset = LazySupervisedDataset(data_path="", tokenizer=tokenizer, data_args=data_args)
+    collator = DataCollatorForstreamDataset(tokenizer=tokenizer)
+    loader = DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collator)
 
-    # Sliding window
-    t = args.t_start
-    n_silence = 0
-    n_response = 0
-    p_resp_history = []
-    while t + args.window <= args.t_end:
-        clip_path = os.path.join(args.clip_cache, f"clip_{int(t*100):08d}_{int(args.window*100):04d}.mp4")
-        try:
-            extract_subclip(args.video, t, args.window, clip_path)
-            enc = processor(
-                text=["<video>"], videos=[clip_path],
-                video_backend="codec", return_tensors="pt", padding=False,
-            )
-            codec_dict = {
-                "pixel_values": enc["pixel_values"].to(device=device, dtype=torch.bfloat16),
-                "image_grid_thw": enc["image_grid_thw"].to(device=device),
-                "patch_positions": enc["patch_positions"].to(device=device),
-            }
-        except Exception as e:
-            print(f"[t={t:6.1f}] codec failed: {e}")
-            t += args.step
-            continue
+    total_silence_correct = 0
+    total_silence = 0
+    total_response_correct = 0
+    total_response = 0
+
+    n_done = 0
+    for batch_idx, inputs in enumerate(loader):
+        if n_done >= args.max_halves:
+            break
+        n_done += 1
+        # move tensors to device (collator keeps lists for images)
+        for k, v in list(inputs.items()):
+            if torch.is_tensor(v):
+                inputs[k] = v.to(device)
 
         with torch.no_grad():
-            # Mimic Path-B (cls_training) input format at inference time so the
-            # ClsNet sees the same distribution it was trained on. For one
-            # window of N canvas features, build:
-            #   [frame_0, eos_emb, frame_1, eos_emb, ..., frame_{N-1}, cap_emb]
-            # then einops "(b t) c -> b t c" t=2. Return logits at position 1
-            # (target slot) for the last batch entry (which corresponds to the
-            # final frame paired with caption_target).
-            past_frames = getattr(model, "_demo_past_frames", None)
-            interval_id_list = getattr(model, "_demo_interval_ids", [])
+            outputs = model(**inputs)
 
-            # Run vision tower + Mamba EPFE on the new clip
-            X_features, cls_logits_at_caption, new_frames, interval_id = (
-                model.encode_images_or_videos_score_cls_inference_allframe_demo(
-                    codec_dict, past_frames, frames_features_shape=interval_id_list
-                )
-            )
-            model._demo_past_frames = new_frames
-            interval_id_list.append(interval_id)
-            model._demo_interval_ids = interval_id_list
-
-            # cls_logits_at_caption is logits at the cap_emb position (vocab=2)
-            # The Mamba projector returns the cls_demo path's logits[0][-1].
-            cls_probs = torch.softmax(cls_logits_at_caption.float().flatten(), dim=-1).tolist()
-            cls_pred_int = int(torch.tensor(cls_probs).argmax().item())
-
-        if cls_pred_int == 0:
-            n_silence += 1
-            print(f"[t={t:6.1f}] cls=0 p_sil={cls_probs[0]:.3f} p_resp={cls_probs[1]:.3f}")
+        # `outputs` is whatever model.forward returns for cls path. Per
+        # `OneVisionStreamForCausalLM.forward`, when cls_output is not None it
+        # returns cls_output directly (a CausalLMOutputWithPast-shaped object).
+        # The paper eval then unpacks (outputs, labels) via:
+        #   outputs, labels = model(**inputs)
+        # We replicate this and grab the `labels` from outputs.logits / .loss.
+        # In paper's projector, the cls path returns (cls_output, cls_label).
+        # Our train.py forward wraps that to single object; we re-call the
+        # encoder directly to grab both pieces.
+        if isinstance(outputs, tuple):
+            cls_output, cls_label = outputs
         else:
-            n_response += 1
-            print(f"[t={t:6.1f}] cls=1 p_sil={cls_probs[0]:.3f} p_resp={cls_probs[1]:.3f}")
+            cls_output = outputs
+            cls_label = inputs.get("labels", None)
+            if cls_label is None:
+                # The cls path's label is built inside projector; recover via
+                # a private re-call.
+                raise RuntimeError("could not recover cls_label from model output")
 
-        # GT alignment: print any GT caption that lies in [t, t+step)
-        for (g_t, g_txt) in gt_list:
-            if t <= g_t < t + args.step:
-                print(f"    GT @ {g_t}s: {g_txt}")
+        logits = cls_output.logits  # [B, T, vocab=2]
+        logits = logits[..., :-1, :]
+        labels = cls_label[..., 1:].to(logits.device)
 
-        t += args.step
+        # Flatten per paper eval (line 263-279): treat the (b, t=2) batching by
+        # concatenating sequences and picking target slots where label != IGNORE.
+        logits_flat = logits.reshape(-1, logits.shape[-1])
+        labels_flat = labels.reshape(-1)
+        target_mask = labels_flat != IGNORE_INDEX
+        eos_logits = logits_flat[target_mask]
+        eos_labels = labels_flat[target_mask]
 
-    print(f"\n[demo] done. silence={n_silence} response={n_response}")
+        probs = torch.softmax(eos_logits.float(), dim=-1)
+        preds = probs.argmax(dim=-1)
+
+        # paper labels: 0 = silence, 1 = response (these are cls_net vocab ids)
+        silence_mask = eos_labels == 0
+        response_mask = eos_labels == 1
+        silence_correct = (preds[silence_mask] == 0).sum().item()
+        response_correct = (preds[response_mask] == 1).sum().item()
+        n_silence = silence_mask.sum().item()
+        n_response = response_mask.sum().item()
+
+        total_silence += n_silence
+        total_silence_correct += silence_correct
+        total_response += n_response
+        total_response_correct += response_correct
+
+        print(f"[half {n_done}] target_slots={target_mask.sum().item()} "
+              f"silence_acc={silence_correct}/{n_silence} "
+              f"response_acc={response_correct}/{n_response} "
+              f"p_resp_mean={probs[:, 1].mean().item():.3f}")
+
+    print(f"\n[demo] overall:")
+    print(f"  silence acc: {total_silence_correct}/{total_silence} = {total_silence_correct / max(total_silence, 1):.3f}")
+    print(f"  response acc: {total_response_correct}/{total_response} = {total_response_correct / max(total_response, 1):.3f}")
 
 
 if __name__ == "__main__":
