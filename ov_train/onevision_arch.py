@@ -270,8 +270,16 @@ class OneVisionStreamMetaForCausalLM(ABC):
 
  
     def encode_images_or_videos_score_cls_inference_allframe_demo(self, images_or_videos, past_frames_features, frames_features_shape):
+        # Demo path normally receives a single segment as either a 4-D frame
+        # tensor [T, C, H, W] or, in codec mode, a single dict. The training
+        # entry point however passes a list-of-1 (because we use the
+        # autoregressive multi-segment splice during training). Normalize to a
+        # single segment here.
+        if isinstance(images_or_videos, list):
+            assert len(images_or_videos) == 1, f"demo expects 1 segment, got {len(images_or_videos)}"
+            images_or_videos = images_or_videos[0]
+
         if isinstance(images_or_videos, dict):
-            # codec path
             frames_features = self._encode_frames_with_onevision(images_or_videos)
         else:
             num_frames = images_or_videos.shape[0]
