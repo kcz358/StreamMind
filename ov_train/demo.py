@@ -125,55 +125,29 @@ def main():
             continue
 
         with torch.no_grad():
-            # Build a minimal LLM prompt with one <video> placeholder for the demo helper.
-            from streammind.mm_utils import tokenizer_MMODAL_token
-            from streammind.constants import MMODAL_TOKEN_INDEX
-            prompt = (
-                "<|im_start|>system\n"
-                "A chat between a curious user and an artificial intelligence assistant. "
-                "The assistant gives helpful, detailed, and polite answers to the user's questions.<|im_end|>\n"
-                "<|im_start|>user\nPlease describe the video content in detail based on the provided information.<video>\n<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
-            input_ids = tokenizer_MMODAL_token(prompt, tokenizer, MMODAL_TOKEN_INDEX["VIDEO"], return_tensors="pt").unsqueeze(0).to(device)
-            attention_mask = torch.ones_like(input_ids)
-
-            # Use the paper's streaming demo helper, which routes through ClsNet
-            # and returns (cls_pred, prepared_inputs_embeds).
+            # Direct encoder-side audit: bypass prepare_inputs* and call the
+            # encode helper that the inference_demo path uses internally. This
+            # gives us the raw cls_feature softmax without the LLM splice.
             past_frames = getattr(model, "_demo_past_frames", None)
             interval_id_list = getattr(model, "_demo_interval_ids", [])
-
-            (
-                _input_ids,
-                _attn,
-                _pkv,
-                inputs_embeds,
-                _,
-                cls_pred,
-                new_frames,
-                interval_id,
-            ) = model.prepare_inputs_labels_for_multimodal_score_stream_inference_demo(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=None,
-                labels=None,
-                X_modalities=[[codec_dict], ["video"]],
-                frames_features=past_frames,
-                interval_id_list=interval_id_list,
+            X_features, cls_feature, new_frames, interval_id = (
+                model.encode_images_or_videos_score_cls_inference_allframe_demo(
+                    codec_dict, past_frames, frames_features_shape=interval_id_list
+                )
             )
             model._demo_past_frames = new_frames
             interval_id_list.append(interval_id)
             model._demo_interval_ids = interval_id_list
 
-        cls_pred_int = int(cls_pred) if cls_pred is not None else 0
+            cls_probs = torch.softmax(cls_feature.float().flatten(), dim=-1).tolist()
+            cls_pred_int = int(torch.tensor(cls_probs).argmax().item())
+
         if cls_pred_int == 0:
             n_silence += 1
-            print(f"[t={t:6.1f}] cls=0 (silence)")
+            print(f"[t={t:6.1f}] cls=0 p_sil={cls_probs[0]:.3f} p_resp={cls_probs[1]:.3f}")
         else:
             n_response += 1
-            if args.audit_only:
-                print(f"[t={t:6.1f}] cls=1 (response, audit_only)")
-            else:
+            print(f"[t={t:6.1f}] cls=1 p_sil={cls_probs[0]:.3f} p_resp={cls_probs[1]:.3f}")
                 with torch.no_grad():
                     out_ids = model.model.language_model.generate(
                         inputs_embeds=inputs_embeds,
