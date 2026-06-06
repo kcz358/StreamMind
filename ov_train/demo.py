@@ -1,50 +1,39 @@
-"""Streaming demo for StreamMind × LLaVA-OneVision-2.
+"""Audit-only streaming demo for paper-faithful StreamMind OneVision.
 
-Plays one MatchTime half by sliding an 8-second window every `--step` seconds.
+For a single MatchTime half, slide an 8-second window every `--step` seconds.
 At every step:
-  1. Encode the 8s clip with the codec backend (same as training).
-  2. Gate forward -> [silence, response] probabilities.
-  3. If response, call base.generate to produce one-line commentary.
+  1. ffmpeg extract subclip → codec backend → ViT → Mamba EPFE → ClsNet
+  2. Print [t_start, p_silence, p_response, predicted_class]
+  3. If predicted_class == 1 (response), call base LLM .generate() to emit a one-line caption
 
-Output: text timeline on stdout. Optional --output_video writes an MP4 with
-generated captions burned in as subtitles.
+This is the paper's `stream_generate_demo` path:
+  prepare_inputs_labels_for_multimodal_score_stream_inference_demo
+    -> encode_images_or_videos_score_cls_inference_allframe_demo  (ViT + Mamba + ClsNet)
+    -> if cls_pred == 1: super().generate(inputs_embeds=...)
 
-Example:
+Run inside the dev pod:
   python -m ov_train.demo \\
-    --resume_from /data/kaichen/StreamMind/stage2_codec_.../checkpoint-13982 \\
-    --video      /data/kaichen/data/MatchTime/features_video/.../1_224p.mkv \\
-    --captions   /data/kaichen/data/MatchTime/dataset/MatchTime/valid/.../Labels-caption.json \\
-    --t_start 0 --t_end 600 --step 2 \\
-    --output_video /tmp/demo.mp4
+    --resume_from /data/kaichen/StreamMind/paper_stage2_codec_.../checkpoint-94 \\
+    --video       /data/kaichen/data/MatchTime/features_video/.../1_224p.mkv \\
+    --captions    /data/kaichen/data/MatchTime/dataset/MatchTime/valid/.../Labels-caption.json \\
+    --half 1 --t_start 0 --t_end 300 --step 2
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import subprocess
 import sys
-import tempfile
-import warnings
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from safetensors.torch import load_file
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ov_train.codec_utils import extract_subclip
-from ov_train.onevision_stream import StreamOneVision
-from ov_train.soccer_dataset import (
-    CODEC_CONFIG,
-    CODEC_MAX_PIXELS,
-    SYSTEM_PROMPT,
-    USER_PROMPT,
-    _parse_game_time,
-)
+from ov_train.onevision_stream import OneVisionStreamForCausalLM
 
 
 # ---------------------------------------------------------------- args
@@ -58,196 +47,150 @@ def parse_args():
     p.add_argument("--t_start", type=float, default=0.0)
     p.add_argument("--t_end", type=float, default=300.0)
     p.add_argument("--step", type=float, default=2.0, help="sliding stride in seconds")
-    p.add_argument("--window", type=float, default=8.0, help="context window in seconds")
-    p.add_argument("--gate_thresh", type=float, default=0.5,
-                   help="response prob >= this triggers generation")
-    p.add_argument("--max_new_tokens", type=int, default=60)
+    p.add_argument("--window", type=float, default=8.0, help="window length in seconds")
+    p.add_argument("--audit_only", action="store_true", help="skip LLM generate, only print gate")
     p.add_argument("--clip_cache", default="/tmp/demo_clips")
-    p.add_argument("--codec_cache", default="/tmp/demo_codec_cache")
-    p.add_argument("--output_video", default=None, help="if set, burn subtitles into mp4")
-    p.add_argument("--audit_only", action="store_true",
-                   help="skip generation; just dump gate probs over time + AUC vs GT")
     return p.parse_args()
 
 
-# ---------------------------------------------------------------- helpers
-def build_prompt_messages():
-    return [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-        {"role": "user", "content": [
-            {"type": "video"},
-            {"type": "text", "text": USER_PROMPT},
-        ]},
-    ]
-
-
-def load_gt_captions(path: str | None, half: int) -> list[tuple[float, str]]:
-    if not path:
+def _parse_gt(captions_path: str, half: int):
+    """Return list of (t_sec, text) for ground-truth captions in given half."""
+    if not captions_path:
         return []
-    data = json.loads(Path(path).read_text())
-    out = []
+    data = json.load(open(captions_path))
+    gts = []
     for ann in data.get("annotations", []):
-        gt = ann.get("gameTime")
-        text = ann.get("anonymized") or ann.get("description")
-        if not gt or not text:
-            continue
+        gameTime = ann.get("gameTime", "")
         try:
-            h, t = _parse_game_time(gt)
+            h_str, mmss = gameTime.split(" - ")
+            h = int(h_str.strip().split(" ")[0])
+            if h != half:
+                continue
+            m, s = mmss.strip().split(":")
+            t = int(m) * 60 + int(s)
         except Exception:
             continue
-        if h == half:
-            out.append((float(t), text.strip()))
-    return sorted(out)
+        gts.append((t, ann.get("anonymized", ann.get("description", ""))))
+    return sorted(gts)
 
 
-def secs_to_srt_ts(t: float) -> str:
-    h = int(t // 3600); m = int((t % 3600) // 60); s = t - 3600 * h - 60 * m
-    return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
-
-
-def write_srt(events: list[tuple[float, str]], path: str, t_start: float, dur_per_caption: float = 4.0):
-    """Each caption shown for `dur_per_caption` seconds (or until next one)."""
-    with open(path, "w") as f:
-        for i, (t, text) in enumerate(events):
-            t0 = max(0.0, t - t_start)
-            t1 = t0 + dur_per_caption
-            if i + 1 < len(events):
-                t1 = min(t1, max(0.0, events[i + 1][0] - t_start))
-            f.write(f"{i + 1}\n{secs_to_srt_ts(t0)} --> {secs_to_srt_ts(t1)}\n{text}\n\n")
-
-
-def burn_subs(src_video: str, srt_path: str, t_start: float, t_end: float, out_path: str):
-    dur = t_end - t_start
-    # Escape srt path for ffmpeg subtitles filter (commas/colons in paths break it).
-    safe_srt = srt_path.replace(":", r"\:").replace(",", r"\,")
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-ss", f"{t_start:.3f}", "-t", f"{dur:.3f}",
-        "-i", src_video,
-        "-vf", f"subtitles='{safe_srt}'",
-        "-c:a", "copy",
-        out_path,
-    ]
-    subprocess.run(cmd, check=True)
-
-
-# ---------------------------------------------------------------- main
 def main():
     args = parse_args()
-    Path(args.clip_cache).mkdir(parents=True, exist_ok=True)
-    os.environ["ONLINE_CODEC_CACHE_DIR"] = args.codec_cache
-    Path(args.codec_cache).mkdir(parents=True, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(args.clip_cache, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[demo] loading processor + model... (this takes ~1 min)", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
 
-    model = StreamOneVision(args.model_path)
-    state = load_file(os.path.join(args.resume_from, "model.safetensors"))
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    print(f"[demo] resumed: {len(state)} tensors loaded "
-          f"(missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
-    model = model.to(device).eval()
+    print(f"[demo] loading base model: {args.model_path}")
+    model = OneVisionStreamForCausalLM(args.model_path)
+    model.add_streammind_special_tokens(tokenizer)
 
-    gts = load_gt_captions(args.captions, args.half)
-    print(f"[demo] ground-truth captions in half {args.half}: {len(gts)}", flush=True)
+    print(f"[demo] loading stage2 ckpt: {args.resume_from}")
+    sd = load_file(os.path.join(args.resume_from, "model.safetensors"))
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    print(f"[demo]   loaded={len(sd) - len(unexpected)} missing={len(missing)} unexpected={len(unexpected)}")
 
-    prompt_msgs = build_prompt_messages()
-    text_prompt = processor.apply_chat_template(
-        prompt_msgs, tokenize=False, add_generation_prompt=True
-    )
+    model = model.to(device=device, dtype=torch.bfloat16).eval()
 
-    events: list[tuple[float, str]] = []
-    gate_trace: list[tuple[float, float]] = []  # (t, respond_prob)
-    t = args.t_start + args.window
-    while t <= args.t_end:
-        clip = Path(args.clip_cache) / f"demo_t{int(t * 100):08d}.mp4"
+    # silence / response token ids (set on the Mamba projector during init)
+    silence_id = model.model.mm_projector.silence_token_id
+    response_id = model.model.mm_projector.response_token_id
+    print(f"[demo] silence_id={silence_id} response_id={response_id}")
+
+    gt_list = _parse_gt(args.captions, args.half)
+    print(f"[demo] ground-truth captions in half {args.half}: {len(gt_list)}")
+
+    # Sliding window
+    t = args.t_start
+    n_silence = 0
+    n_response = 0
+    p_resp_history = []
+    while t + args.window <= args.t_end:
+        clip_path = os.path.join(args.clip_cache, f"clip_{int(t*100):08d}_{int(args.window*100):04d}.mp4")
         try:
-            extract_subclip(args.video, t - args.window, args.window, clip)
+            extract_subclip(args.video, t, args.window, clip_path)
+            enc = processor(
+                text=["<video>"], videos=[clip_path],
+                video_backend="codec", return_tensors="pt", padding=False,
+            )
+            codec_dict = {
+                "pixel_values": enc["pixel_values"].to(device=device, dtype=torch.bfloat16),
+                "image_grid_thw": enc["image_grid_thw"].to(device=device),
+                "patch_positions": enc["patch_positions"].to(device=device),
+            }
         except Exception as e:
-            print(f"[t={t:7.2f}s] skip (clip fail: {e})", flush=True)
-            t += args.step; continue
-
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                inputs = processor(
-                    text=[text_prompt],
-                    videos=[str(clip)],
-                    video_backend="codec",
-                    codec_config=CODEC_CONFIG,
-                    max_pixels=CODEC_MAX_PIXELS,
-                    return_tensors="pt",
-                    padding=False,
-                )
-        except Exception as e:
-            print(f"[t={t:7.2f}s] skip (codec fail: {e})", flush=True)
-            t += args.step; continue
-
-        inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
-        gate_pos = torch.tensor([inputs["input_ids"].size(1) - 1], device=device)
+            print(f"[t={t:6.1f}] codec failed: {e}")
+            t += args.step
+            continue
 
         with torch.no_grad():
-            out = model.base(**inputs, output_hidden_states=True, return_dict=True)
-            h = out.hidden_states[-1]
-            g_in = h[torch.arange(h.size(0), device=device), gate_pos]
-            # gate is fp32; base hidden is bf16
-            g_logits = model.gate(g_in.float())
-            probs = F.softmax(g_logits, dim=-1).squeeze(0).tolist()
+            # Build a minimal LLM prompt with one <video> placeholder for the demo helper.
+            from streammind.mm_utils import tokenizer_MMODAL_token
+            from streammind.constants import MMODAL_TOKEN_INDEX
+            prompt = (
+                "<|im_start|>system\n"
+                "A chat between a curious user and an artificial intelligence assistant. "
+                "The assistant gives helpful, detailed, and polite answers to the user's questions.<|im_end|>\n"
+                "<|im_start|>user\nPlease describe the video content in detail based on the provided information.<video>\n<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+            input_ids = tokenizer_MMODAL_token(prompt, tokenizer, MMODAL_TOKEN_INDEX["VIDEO"], return_tensors="pt").unsqueeze(0).to(device)
+            attention_mask = torch.ones_like(input_ids)
 
-        respond_prob = probs[1]
-        gate_trace.append((t, respond_prob))
-        if args.audit_only:
-            print(f"[t={t:7.2f}s gate={respond_prob:.4f}]", flush=True)
-        elif respond_prob >= args.gate_thresh:
-            with torch.no_grad():
-                gen = model.base.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                )
-            new_ids = gen[0, inputs["input_ids"].size(1):]
-            caption = processor.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-            events.append((t, caption))
-            print(f"[t={t:7.2f}s gate={respond_prob:.2f}] {caption}", flush=True)
+            # Use the paper's streaming demo helper, which routes through ClsNet
+            # and returns (cls_pred, prepared_inputs_embeds).
+            past_frames = getattr(model, "_demo_past_frames", None)
+            interval_id_list = getattr(model, "_demo_interval_ids", [])
+
+            (
+                _input_ids,
+                _attn,
+                _pkv,
+                inputs_embeds,
+                _,
+                cls_pred,
+                new_frames,
+                interval_id,
+            ) = model.prepare_inputs_labels_for_multimodal_score_stream_inference_demo(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                labels=None,
+                X_modalities=[[codec_dict], ["video"]],
+                frames_features=past_frames,
+                interval_id_list=interval_id_list,
+            )
+            model._demo_past_frames = new_frames
+            interval_id_list.append(interval_id)
+            model._demo_interval_ids = interval_id_list
+
+        cls_pred_int = int(cls_pred) if cls_pred is not None else 0
+        if cls_pred_int == 0:
+            n_silence += 1
+            print(f"[t={t:6.1f}] cls=0 (silence)")
         else:
-            print(f"[t={t:7.2f}s gate={respond_prob:.2f}] (silence)", flush=True)
+            n_response += 1
+            if args.audit_only:
+                print(f"[t={t:6.1f}] cls=1 (response, audit_only)")
+            else:
+                with torch.no_grad():
+                    out_ids = model.model.language_model.generate(
+                        inputs_embeds=inputs_embeds,
+                        max_new_tokens=64,
+                        do_sample=False,
+                    )
+                text = tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
+                print(f"[t={t:6.1f}] cls=1 RESP: {text}")
+
+        # GT alignment: print any GT caption that lies in [t, t+step)
+        for (g_t, g_txt) in gt_list:
+            if t <= g_t < t + args.step:
+                print(f"    GT @ {g_t}s: {g_txt}")
 
         t += args.step
 
-    # Optional comparison with ground truth
-    if gts:
-        print("\n[demo] === ground-truth timeline ===")
-        for t, text in gts:
-            if args.t_start <= t <= args.t_end:
-                print(f"  GT [t={t:7.2f}s] {text}")
-
-    if gate_trace:
-        import numpy as np
-        probs = np.array([p for _, p in gate_trace])
-        ts = np.array([t for t, _ in gate_trace])
-        print(f"\n[audit] gate prob stats: min={probs.min():.4f} mean={probs.mean():.4f} "
-              f"max={probs.max():.4f} std={probs.std():.4f}")
-        # Mark each step as positive (within ±gap of any GT) or negative
-        gap = 3.0
-        gt_ts = np.array([t for t, _ in gts if args.t_start <= t <= args.t_end])
-        if len(gt_ts) > 0:
-            is_pos = np.array([(np.abs(gt_ts - t).min() <= gap) for t in ts])
-            print(f"[audit] within ±{gap}s of GT caption: {is_pos.sum()}/{len(ts)} steps")
-            if is_pos.any() and (~is_pos).any():
-                p_pos = probs[is_pos]
-                p_neg = probs[~is_pos]
-                print(f"[audit]   positive steps gate: mean={p_pos.mean():.4f} max={p_pos.max():.4f}")
-                print(f"[audit]   negative steps gate: mean={p_neg.mean():.4f} max={p_neg.max():.4f}")
-                print(f"[audit]   separation: pos_mean - neg_mean = {p_pos.mean() - p_neg.mean():+.4f}")
-
-    # Optional subtitle burn-in
-    if args.output_video and events:
-        srt = args.output_video + ".srt"
-        write_srt(events, srt, args.t_start)
-        print(f"\n[demo] writing video with burnt subtitles -> {args.output_video}", flush=True)
-        burn_subs(args.video, srt, args.t_start, args.t_end, args.output_video)
-        print(f"[demo] done. srt at {srt}", flush=True)
+    print(f"\n[demo] done. silence={n_silence} response={n_response}")
 
 
 if __name__ == "__main__":

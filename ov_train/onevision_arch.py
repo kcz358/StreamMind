@@ -270,31 +270,23 @@ class OneVisionStreamMetaForCausalLM(ABC):
 
  
     def encode_images_or_videos_score_cls_inference_allframe_demo(self, images_or_videos, past_frames_features, frames_features_shape):
-        # import pdb
-        # pdb.set_trace()
-        num_frames = images_or_videos.shape[0]
-        videos = images_or_videos.unsqueeze(0)
-
-        assert len(videos.size()) == 5
-        batch_size = videos.size(0)
-        # import pdb
-        # pdb.set_trace()
-
-        frames_features = self._encode_frames_with_onevision(videos, max_frames=600)
+        if isinstance(images_or_videos, dict):
+            # codec path
+            frames_features = self._encode_frames_with_onevision(images_or_videos)
+        else:
+            num_frames = images_or_videos.shape[0]
+            videos = images_or_videos.unsqueeze(0)
+            assert len(videos.size()) == 5
+            frames_features = self._encode_frames_with_onevision(videos, max_frames=600)
         if past_frames_features is not None:
             frames_features = torch.cat((past_frames_features, frames_features), dim = 1)
 
         interval_id = frames_features.shape[1]
-        # X_features = self.temporal_aggregator(frames_features, 
 
         X_features, cls_feature = self.temporal_aggregator(frames_features, 
                                                         cls_inference = False, cls_training = False, cls_demo = True,
                                                         frames_features_shape = frames_features_shape)
-        # cls_feature = torch.tensor([0.9,0.1]).cuda()
-        # import pdb
-        # pdb.set_trace()
-        # torch.save(X_features,"/home/v-dingxin/videollama2_plus-main/paper/videollama2_feature_data/videollama2_feature_{}.pt".format(interval_id))
-        return X_features, cls_feature,frames_features,interval_id#这个就是过那个connector，见下
+        return X_features, cls_feature,frames_features,interval_id
 
 
     def mamba_encode_images_or_videos_score(self, frames_features):
