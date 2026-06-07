@@ -1,26 +1,26 @@
-"""Paper-faithful audit demo for StreamMind OneVision.
+"""Paper-faithful streaming demo for StreamMind OneVision.
 
-This script mirrors the paper's `eval_type=cls` evaluation path in
-`streammind/eval/inference_video_ego4d_stream_parallel_new.py`:
+Two-pass:
+  Pass 1 (cls audit): Forward whole half through cls_inference path (same as
+    paper eval_type=cls) -> per-segment gate decisions + GT labels.
+  Pass 2 (caption generate, only on fire segments): For each segment where the
+    gate predicted response=1, build a single-video stage1 prompt and call
+    LLM.generate() to produce the actual commentary text.
 
-  1. Build LazySupervisedDataset with soccer_dataset_train_cls=True (same as
-     training).
-  2. Forward one half through the model with cls_inference=True (paper Path-B,
-     same distribution as cls_training).
-  3. Extract logits at the target slots (cls_label != IGNORE_INDEX) and
-     argmax to get per-segment silence/response predictions.
-  4. Compare to ground-truth cls_label and print accuracy.
+This avoids paper's buggy `stream_generate_demo` (which uses cls_demo single-
+frame path) and stays aligned with our pair-based ClsNet training.
 
-Run inside the dev pod (single GPU is enough):
+Usage inside dev pod:
   python -m ov_train.demo \\
-    --resume_from /data/kaichen/StreamMind/paper_stage2_codec_.../checkpoint-94 \\
-    --max_halves 1
+    --resume_from /data/kaichen/StreamMind/paper_stage2_codec_.../checkpoint-470 \\
+    --data_type valid --max_halves 1
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+from copy import deepcopy
 
 import torch
 from safetensors.torch import load_file
@@ -29,7 +29,8 @@ from transformers import AutoProcessor, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from streammind.constants import IGNORE_INDEX
+from streammind.constants import IGNORE_INDEX, MMODAL_TOKEN_INDEX
+from streammind.mm_utils import tokenizer_MMODAL_token
 from ov_train.onevision_stream import OneVisionStreamForCausalLM
 from ov_train.stream_dataset import (
     DataArguments,
@@ -38,13 +39,57 @@ from ov_train.stream_dataset import (
 from ov_train.train import DataCollatorForstreamDataset, _resolve_image_processor
 
 
+SYS_PROMPT = (
+    "A chat between a curious user and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions."
+)
+USER_PREFIX = "Please describe the video content in detail based on the provided information."
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_path", default="/data/kaichen/LLaVA-OneVision-1.5-RL/pretrained/LLaVA-OneVision-2-8B-Instruct")
     p.add_argument("--resume_from", required=True, help="stage2 checkpoint dir")
-    p.add_argument("--data_type", default="valid", help="train|valid")
+    p.add_argument("--data_type", default="valid")
     p.add_argument("--max_halves", type=int, default=1)
+    p.add_argument("--max_new_tokens", type=int, default=80)
+    p.add_argument("--max_generate_segs", type=int, default=20, help="cap LLM.generate calls per half")
     return p.parse_args()
+
+
+@torch.no_grad()
+def generate_for_segment(model, tokenizer, segment_video_dict, device, max_new_tokens):
+    """Run LLM.generate on a single segment's codec dict and return decoded text."""
+    messages = [
+        {"role": "system", "content": SYS_PROMPT},
+        {"role": "user", "content": USER_PREFIX + "<video>\n"},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    input_ids = tokenizer_MMODAL_token(prompt, tokenizer, MMODAL_TOKEN_INDEX["VIDEO"], return_tensors="pt").unsqueeze(0).to(device)
+    attention_mask = torch.ones_like(input_ids)
+    images = [[segment_video_dict], ["video"]]
+
+    (
+        new_input_ids,
+        new_attn,
+        _pkv,
+        inputs_embeds,
+        _labels,
+    ) = model.prepare_inputs_labels_for_multimodal(
+        input_ids, attention_mask, None, None, images,
+    )
+
+    if inputs_embeds is None:
+        return "(no inputs_embeds)"
+
+    out_ids = model.model.language_model.generate(
+        inputs_embeds=inputs_embeds.to(dtype=torch.bfloat16),
+        attention_mask=new_attn,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+    )
+    text = tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
+    return text
 
 
 def main():
@@ -78,87 +123,83 @@ def main():
 
     model = model.to(device=device, dtype=torch.bfloat16).eval()
 
-    silence_id = model.model.mm_projector.silence_token_id
-    response_id = model.model.mm_projector.response_token_id
-    print(f"[demo] silence_id={silence_id} response_id={response_id}")
-
     dataset = LazySupervisedDataset(data_path="", tokenizer=tokenizer, data_args=data_args)
     collator = DataCollatorForstreamDataset(tokenizer=tokenizer)
     loader = DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collator)
-
-    total_silence_correct = 0
-    total_silence = 0
-    total_response_correct = 0
-    total_response = 0
 
     n_done = 0
     for batch_idx, inputs in enumerate(loader):
         if n_done >= args.max_halves:
             break
         n_done += 1
-        # move tensors to device (collator keeps lists for images)
         for k, v in list(inputs.items()):
             if torch.is_tensor(v):
                 inputs[k] = v.to(device)
 
+        # ---- Pass 1: cls audit on whole half ----
         with torch.no_grad():
             outputs = model(**inputs)
-
-        # `outputs` is whatever model.forward returns for cls path. Per
-        # `OneVisionStreamForCausalLM.forward`, when cls_output is not None it
-        # returns cls_output directly (a CausalLMOutputWithPast-shaped object).
-        # The paper eval then unpacks (outputs, labels) via:
-        #   outputs, labels = model(**inputs)
-        # We replicate this and grab the `labels` from outputs.logits / .loss.
-        # In paper's projector, the cls path returns (cls_output, cls_label).
-        # Our train.py forward wraps that to single object; we re-call the
-        # encoder directly to grab both pieces.
         if isinstance(outputs, tuple):
             cls_output, cls_label = outputs
         else:
-            cls_output = outputs
-            cls_label = inputs.get("labels", None)
-            if cls_label is None:
-                # The cls path's label is built inside projector; recover via
-                # a private re-call.
-                raise RuntimeError("could not recover cls_label from model output")
-
-        logits = cls_output.logits  # [B, T, vocab=2]
-        logits = logits[..., :-1, :]
-        labels = cls_label[..., 1:].to(logits.device)
-
-        # Flatten per paper eval (line 263-279): treat the (b, t=2) batching by
-        # concatenating sequences and picking target slots where label != IGNORE.
+            print(f"[half {n_done}] unexpected model output type: {type(outputs)}")
+            continue
+        logits = cls_output.logits[..., :-1, :]
+        labels_shift = cls_label[..., 1:].to(logits.device)
         logits_flat = logits.reshape(-1, logits.shape[-1])
-        labels_flat = labels.reshape(-1)
+        labels_flat = labels_shift.reshape(-1)
         target_mask = labels_flat != IGNORE_INDEX
         eos_logits = logits_flat[target_mask]
         eos_labels = labels_flat[target_mask]
-
         probs = torch.softmax(eos_logits.float(), dim=-1)
         preds = probs.argmax(dim=-1)
-
-        # paper labels: 0 = silence, 1 = response (these are cls_net vocab ids)
-        silence_mask = eos_labels == 0
-        response_mask = eos_labels == 1
-        silence_correct = (preds[silence_mask] == 0).sum().item()
-        response_correct = (preds[response_mask] == 1).sum().item()
-        n_silence = silence_mask.sum().item()
-        n_response = response_mask.sum().item()
-
-        total_silence += n_silence
-        total_silence_correct += silence_correct
-        total_response += n_response
-        total_response_correct += response_correct
-
+        fire_idx = (preds == 1).nonzero(as_tuple=True)[0].tolist()
+        gt_idx = (eos_labels == 1).nonzero(as_tuple=True)[0].tolist()
         print(f"[half {n_done}] target_slots={target_mask.sum().item()} "
-              f"silence_acc={silence_correct}/{n_silence} "
-              f"response_acc={response_correct}/{n_response} "
-              f"p_resp_mean={probs[:, 1].mean().item():.3f}")
+              f"gate_fired={len(fire_idx)} gt_response={len(gt_idx)}")
 
-    print(f"\n[demo] overall:")
-    print(f"  silence acc: {total_silence_correct}/{total_silence} = {total_silence_correct / max(total_silence, 1):.3f}")
-    print(f"  response acc: {total_response_correct}/{total_response} = {total_response_correct / max(total_response, 1):.3f}")
+        # ---- Pass 2: for each fire, find which segment it belongs to and
+        # generate caption ----
+        # Each segment has its own (frame, target) pairs. The fire indices tell
+        # us which target slot (after pair-flattening) predicted response. We
+        # need the matching original segment index.
+        # In Path B, each segment of N frames produces N pair rows (the last
+        # one has label==1, the others label==0). So a fire at the *last* row
+        # of a segment block corresponds to that segment's caption boundary.
+        # Easiest: any segment whose last-pair index is in fire_idx -> generate
+        # for that segment.
+        # We don't have direct segment indices here; reconstruct by walking
+        # gt_idx (each gt_idx item == last pair row of one segment).
+        segment_video_dicts = inputs.get("images")  # [[codec_dict_seg_0, ..., codec_dict_seg_M], ["video"]]
+        if segment_video_dicts is None or len(segment_video_dicts[0]) == 0:
+            continue
+        seg_codec_list = segment_video_dicts[0]
+
+        n_generated = 0
+        for seg_idx, last_pair_pos in enumerate(gt_idx):
+            if n_generated >= args.max_generate_segs:
+                break
+            fired = last_pair_pos in fire_idx
+            if not fired:
+                continue
+            if seg_idx >= len(seg_codec_list):
+                break
+            seg_dict = seg_codec_list[seg_idx]
+            if not isinstance(seg_dict, dict):
+                continue
+            # move codec tensors to device
+            seg_dict_d = {
+                k: (v.to(device=device, dtype=torch.bfloat16) if k == "pixel_values" else v.to(device))
+                for k, v in seg_dict.items()
+            }
+            try:
+                text = generate_for_segment(model, tokenizer, seg_dict_d, device, args.max_new_tokens)
+            except Exception as e:
+                text = f"(generate failed: {e})"
+            n_generated += 1
+            print(f"  seg {seg_idx} fired -> {text[:200]}")
+
+        print(f"[half {n_done}] generated {n_generated} captions.")
 
 
 if __name__ == "__main__":
