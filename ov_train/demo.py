@@ -82,13 +82,30 @@ def generate_for_segment(model, tokenizer, segment_video_dict, device, max_new_t
     if inputs_embeds is None:
         return "(no inputs_embeds)"
 
-    out_ids = model.model.language_model.generate(
-        inputs_embeds=inputs_embeds.to(dtype=torch.bfloat16),
-        attention_mask=new_attn,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-    )
-    text = tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
+    # Greedy decode loop using the base language_model trunk + ov_model.lm_head.
+    # We can't call .generate() because language_model is the base Qwen3Model
+    # (no generation mixin) and ov_model.generate() runs the full multimodal
+    # pipeline including the vision tower.
+    cur_embeds = inputs_embeds.to(dtype=torch.bfloat16)
+    cur_attn = new_attn
+    eos_id = tokenizer.eos_token_id
+    new_token_ids = []
+    embed_layer = model.model.language_model.get_input_embeddings()
+    for _ in range(max_new_tokens):
+        out = model.model.language_model(
+            inputs_embeds=cur_embeds,
+            attention_mask=cur_attn,
+        )
+        last_hidden = out.last_hidden_state[:, -1, :]
+        logits = model.lm_head(last_hidden.unsqueeze(1))  # [1, 1, vocab]
+        next_id = logits[0, -1].argmax(dim=-1)
+        new_token_ids.append(next_id.item())
+        if next_id.item() == eos_id:
+            break
+        next_emb = embed_layer(next_id.view(1, 1)).to(dtype=cur_embeds.dtype)
+        cur_embeds = torch.cat([cur_embeds, next_emb], dim=1)
+        cur_attn = torch.cat([cur_attn, torch.ones((1, 1), dtype=cur_attn.dtype, device=cur_attn.device)], dim=1)
+    text = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
     return text
 
 
