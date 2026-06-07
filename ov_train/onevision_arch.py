@@ -229,6 +229,12 @@ class OneVisionStreamMetaForCausalLM(ABC):
     def encode_images_or_videos(self, images_or_videos, modalities):
         num_frames = self.config.num_frames if hasattr(self.config, 'num_frames') else NUM_FRAMES
 
+        # codec dict input(s): forward directly through OneVision helper
+        if all(isinstance(x, dict) for x in images_or_videos):
+            assert len(images_or_videos) == 1, "demo non-stream path expects a single codec dict"
+            frames_features = self._encode_frames_with_onevision(images_or_videos[0])
+            return self.temporal_aggregator(frames_features)
+
         videos = [x.unsqueeze(0).expand(num_frames, -1, -1, -1) if modal == 'image' else x for x, modal in zip(images_or_videos, modalities)]
         videos = torch.stack(videos, dim=0)#[16,8,3,336,336]
 
