@@ -94,34 +94,7 @@ class LazySupervisedDataset(Dataset):
         self.data_type = self.data_args.data_type
         if self.soccer_dataset:
             print("*****************getting_finetune_soccer_data******************")
-            target_filenames = ["1_224p.mkv", "2_224p.mkv"]
-            _matchtime_root = os.environ.get("MATCHTIME_ROOT", "data/MatchTime")
-            self.soccer_video_list = find_video_files(f"{_matchtime_root}/features_video", target_filenames)
-            self.caption_path_list = []
-            self.remove_video_list_id = []
-            for video_id, video_path in enumerate(self.soccer_video_list):
-                caption_path = trans_video_2_json(video_path,self.data_type)
-                if os.path.exists(caption_path):
-                    self.caption_path_list.append(caption_path)
-                else:
-                    self.remove_video_list_id.append(video_id)
-
-            self.soccer_video_list = [item for idx,item in enumerate(self.soccer_video_list) if idx not in self.remove_video_list_id]
-
-            self.caption_dict = dict()
-            self.eos_caption_dict = dict()
-
-            self.timestamp_dict = dict()
-            self.eos_timestamp_dict = dict()
-
-            self.start_timestamp_dict = dict()
-            self.eos_start_timestamp_dict = dict()
-
-            self.half_dict = dict()
-            self.caption_num = 0
-            self.caption_num_pervideo = dict()
-            for video_path_id,video_path in enumerate(self.soccer_video_list):
-                self.preprocess_caption_only_caption_data_soccer(video_path,video_path_id,self.data_type)
+            self._load_soccer_from_parquet()
 
         if self.ego4d_dataset:
             print("*****************getting_finetune_ego4d_data******************")
@@ -603,6 +576,117 @@ class LazySupervisedDataset(Dataset):
                 self.caption_dict[video_path_id].append(caption_list[timeid])
                 self.caption_num += eos_num
                 self.caption_num_pervideo[video_path_id] += eos_num
+
+
+    def _load_soccer_from_parquet(self):
+        """Replace the original (find_video_files + per-game json parse) with a
+        single parquet read. One parquet row = one game, schema:
+          video_path, caption_json_path, source, data_type, half, annotations, num_captions
+        Annotations is a list of {gameTime, anonymized}. We expand them into the
+        same per-game dicts the rest of the dataset / Path-B training expects.
+        """
+        import pandas as _pd
+        manifest_dir = os.environ.get(
+            "SOCCER_MANIFEST_DIR",
+            os.path.join(os.environ.get("MATCHTIME_ROOT", "data/MatchTime"), "manifests"),
+        )
+        manifest_path = os.path.join(manifest_dir, f"{self.data_type}.parquet")
+        if not os.path.exists(manifest_path):
+            raise FileNotFoundError(
+                f"soccer manifest not found: {manifest_path}. Run "
+                "`python -m ov_train.build_manifest --out_dir <manifest_dir>` first."
+            )
+        df = _pd.read_parquet(manifest_path)
+
+        # Optional source filter via env. Default: include everything.
+        srcs_env = os.environ.get("SOCCER_SOURCES", "")
+        if srcs_env:
+            keep = [s.strip() for s in srcs_env.split(",") if s.strip()]
+            df = df[df["source"].isin(keep)].reset_index(drop=True)
+
+        self.soccer_video_list = df["video_path"].tolist()
+        self.caption_path_list = df["caption_json_path"].tolist()
+        self.caption_dict = dict()
+        self.eos_caption_dict = dict()
+        self.timestamp_dict = dict()
+        self.eos_timestamp_dict = dict()
+        self.start_timestamp_dict = dict()
+        self.eos_start_timestamp_dict = dict()
+        self.half_dict = dict()
+        self.caption_num = 0
+        self.caption_num_pervideo = dict()
+
+        for vid, row in df.iterrows():
+            half = int(row["half"])
+            anns = list(row["annotations"])
+            # Build (timestamp_sec, caption) list for this game's half. The
+            # original parser scans annotations top-to-bottom from the json,
+            # then reverses, then walks pairs to produce (start_time, end_time).
+            ts_list = []
+            cap_list = []
+            for a in anns:
+                gt = a.get("gameTime", "")
+                if " - " not in gt:
+                    continue
+                head, mmss = gt.split(" - ", 1)
+                try:
+                    h = int(head.strip().split(" ")[0])
+                except Exception:
+                    continue
+                if h != half:
+                    continue
+                try:
+                    mm, ss = mmss.strip().split(":")
+                    ts = int(mm) * 60 + int(ss)
+                except Exception:
+                    continue
+                cap = a.get("anonymized", a.get("description", ""))
+                if not cap:
+                    continue
+                ts_list.append(ts)
+                cap_list.append(cap)
+
+            # Reverse: original code does timestamp_list = timestamp_list[::-1]
+            ts_list = ts_list[::-1]
+            cap_list = cap_list[::-1]
+
+            kept_ts, kept_start, kept_cap, kept_half = [], [], [], []
+            for tid, ts in enumerate(ts_list):
+                if tid == 0:
+                    start = min(0, ts - 1 / self.cur_fps)
+                    if start < 0:
+                        continue
+                else:
+                    start = ts_list[tid - 1]
+                    if start == ts:
+                        continue
+                kept_ts.append(ts)
+                kept_start.append(start)
+                kept_cap.append(cap_list[tid])
+                kept_half.append(half)
+
+            self.timestamp_dict[vid] = kept_ts
+            self.start_timestamp_dict[vid] = kept_start
+            self.caption_dict[vid] = kept_cap
+            self.half_dict[vid] = kept_half
+            n = len(kept_cap)
+            self.caption_num += n
+            self.caption_num_pervideo[vid] = (self.caption_num_pervideo.get(vid - 1, 0) if vid > 0 else 0) + n
+
+        # Drop empty games (kept by parquet but filtered to 0 by half/start
+        # constraints above).
+        empty_ids = [i for i, _ in enumerate(self.soccer_video_list) if not self.timestamp_dict.get(i)]
+        if empty_ids:
+            keep_ids = [i for i in range(len(self.soccer_video_list)) if i not in set(empty_ids)]
+            remap = {old: new for new, old in enumerate(keep_ids)}
+            self.soccer_video_list = [self.soccer_video_list[i] for i in keep_ids]
+            self.caption_path_list = [self.caption_path_list[i] for i in keep_ids]
+            for d in (self.timestamp_dict, self.start_timestamp_dict, self.caption_dict, self.half_dict, self.caption_num_pervideo):
+                new_d = {remap[k]: v for k, v in d.items() if k in remap}
+                d.clear()
+                d.update(new_d)
+        print(f"[soccer parquet] {len(self.soccer_video_list)} games "
+              f"({self.caption_num} captions) from {manifest_path}")
 
 
     def preprocess_caption_only_caption_data_soccer(self,video_data_path,video_path_id,data_type):
