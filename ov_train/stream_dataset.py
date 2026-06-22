@@ -813,6 +813,23 @@ class LazySupervisedDataset(Dataset):
                 clip_cache_root,
                 f"{game_key}__t{int(start_timestamp * 100):08d}__d{int(duration * 100):08d}.mp4",
             )
+            # Pre-check codec cache existence: short clips (<min_group_frames)
+            # have no codec on disk; calling ov_proc would invoke cv-preinfer
+            # which races on a flock and stalls blobfuse. Skip such segments.
+            import hashlib as _hashlib
+            from pathlib import Path as _Path
+            _codec_root = os.environ.get(
+                "ONLINE_CODEC_CACHE_DIR",
+                os.path.join(os.environ.get("MATCHTIME_ROOT", "/tmp"), "codec_cache"),
+            )
+            _codec_raw = (
+                f"{clip_path}|tc=32|gs=32|ipg=4|patch=16|mp=150000|mask=off"
+            )
+            _codec_key = _hashlib.md5(_codec_raw.encode()).hexdigest()
+            _codec_dir = os.path.join(_codec_root, f"{_Path(clip_path).stem}_{_codec_key}")
+            if not (os.path.exists(os.path.join(_codec_dir, "meta.json"))
+                    and os.path.exists(os.path.join(_codec_dir, "src_patch_position.npy"))):
+                return None
             try:
                 extract_subclip(video_path, float(start_timestamp), duration, clip_path)
             except Exception:
@@ -822,6 +839,7 @@ class LazySupervisedDataset(Dataset):
                     text=["<video>"],
                     videos=[clip_path],
                     video_backend="codec",
+                    max_pixels=150000,
                     return_tensors="pt",
                     padding=False,
                 )
