@@ -831,14 +831,11 @@ class LazySupervisedDataset(Dataset):
                     and os.path.exists(os.path.join(_codec_dir, "src_patch_position.npy"))):
                 return None
             try:
-                extract_subclip(video_path, float(start_timestamp), duration, clip_path)
-            except Exception:
-                return None
-            try:
                 enc = ov_proc(
                     text=["<video>"],
                     videos=[clip_path],
                     video_backend="codec",
+                    codec_config={"patch": 16, "max_pixels": 150000},
                     max_pixels=150000,
                     return_tensors="pt",
                     padding=False,
