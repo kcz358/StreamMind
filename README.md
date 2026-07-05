@@ -1,95 +1,195 @@
-<h3 align="center"><a href="https://arxiv.org/abs/2503.06220" style="color:#9C276A">
-StreamMind: Unlocking Full Frame Rate Streaming Video Dialogue through Event-Gated Cognition</a></h3>
-<h5 align="center"> If our project helps you, please give us a star ⭐ on GitHub to support us. 🙏🙏 </h2>
+# StreamMind × OneVision-2
 
-<h5 align="center">
+Streaming soccer commentary on top of the [StreamMind](https://arxiv.org/abs/2503.06220)
+event-gated cognition framework, ported to a
+[LLaVA-OneVision-2](https://arxiv.org/abs/2408.03326) backbone with
+[MatchTime](https://arxiv.org/abs/2406.18530) style temporal supervision.
 
-[![arXiv](https://img.shields.io/badge/Arxiv-2503.06220-AD1C18.svg?logo=arXiv)](https://arxiv.org/abs/2503.06220) <br>
+The pipeline keeps StreamMind's two-stage training (Stage-1: generation, Stage-2:
+event gate) and its codec-based video representation, but swaps in an
+OneVision-2 ViT + Qwen3 LLM as the base VLM and consumes precomputed per-segment
+codec caches for fast, causal streaming training.
 
+## 1. Environment
 
-## 📰 News
-* **[2025.03.18]**  Release training, evaluation, and serving codes of StreamMind.
-<div align="center">
-    <img src="./assets/framework_v2.png" alt="overview">
-</div>
+The image bundles PyTorch 2.9 + CUDA 12.9, `transformers>=5.7`, DeepSpeed,
+`flash-attn` 2.8.3, `mamba-ssm`, `codec-video-prep`, and OpenCV. Everything is
+installed against Python 3.12.
 
-<div align="center">
-    <a href="./assets/blind_com_demo.mp4">▶️ Click here to watch the demo video</a>
-</div>
+Build the image (recommended) from the repo root:
 
-## 🛠️ Requirements and Installation
-Basic Dependencies:
-* Python >= 3.10
-* Pytorch >= 2.5.1
-* CUDA Version >= 11.8
-* transformers >= 4.44.2 (for mistral tokenizer)
-* tokenizers >= 0.19.1 (for mistral tokenizer)
-
-**[Online Mode]** Install required packages (better for development):
 ```bash
-git clone https://github.com/xinding-sys/StreamMind
-cd StreamMind
-pip install -r requirements.txt
-pip install flash-attn==2.5.8 --no-build-isolation
+docker build -t streammind-ov:latest .
 ```
 
-## 🚀 Main Results
+Run an interactive container with GPU access:
 
-### Streaming Dialogue
-<div align="center">
-    <img src="./assets/result1.png" alt="overview">
-</div>
-<div align="center">
-    <img src="./assets/result2.png" alt="overview">
-</div>
-
-### Offline benchmark
-<div align="center">
-    <img src="./assets/result3.png" alt="overview">
-</div>
-<div align="center">
-    <img src="./assets/result4.png" alt="overview">
-</div>
-
-
-## 🗝️ Training & Evaluation
-
-### Quick Start
-
-1. Training Data Structure:
 ```bash
-StreamMind
-├── Online_datasets
-│   ├── ego4d
-|   |   ├── v2 
-|   |   |   ├── annotations 
-|   |   |   ├── full_scale
-│   ├── MatchTime
-|   |   ├── SN-caption 
-|   |   ├── Video
-├── Offline_datasets
-│   ├── videollava_pt
-|   |   ├── llava_image/ 
-|   |   ├── valley/      
-|   |   └── valley_llavaimage.json 
-│   ├── videollava_sft
-|   |   ├── llava_image_tune/  
-|   |   ├── videochatgpt_tune/ 
-|   |   └── videochatgpt_llavaimage_tune.json 
-```
-2. Command:
-```bash
-# Streammind train stage 1
-bash scripts/custom/finetune_stage1.sh
-# Streammind train stage 2
-bash scripts/custom/finetune_stage2.sh
-# Streammind evaluate
-bash scripts/custom/eval/evaluate.sh
+docker run --gpus all --shm-size=32g --rm -it \
+    -v $PWD:/workspace/StreamMind \
+    -w /workspace/StreamMind \
+    streammind-ov:latest bash
 ```
 
-## 📑 Citation
+If you prefer a local install, mirror the exact stack in `Dockerfile`; the pinned
+versions have been the only ones we validated end to end.
 
-If you find StreamMind useful for your research and applications, please cite using this BibTeX:
+## 2. Prepare data
+
+We consume a parquet manifest that lists soccer halves (one row = one game +
+half) plus their annotated commentary events. Each row is expanded into a set of
+causal `(video_path, start, end)` segments before training/eval.
+
+### 2.1 Directory layout
+
+```
+$MATCHTIME_ROOT/
+    dataset/           # per-game commentary JSONs (upstream MatchTime)
+    features_video/    # raw match videos (mkv) referenced by video_path
+    manifests/
+        train.parquet
+        valid.parquet
+    clips/             # per-segment MP4 subclips (built by cut_clips.py)
+    codec_cache/       # per-segment codec canvases (built by gen_codec.py)
+```
+
+`MATCHTIME_ROOT` is the relpath base used to compute segment cache keys and
+MUST match the value that training/eval sees.
+
+### 2.2 Cut per-event subclips
+
+`scripts/build_soccer_cache/cut_clips.py` reads the manifest, expands each row
+into segments, and writes `ffmpeg -c copy` cuts under `--clip_dir`. Existing
+non-empty clips are skipped, so it is safe to rerun.
+
+```bash
+python scripts/build_soccer_cache/cut_clips.py \
+    --manifest       $MATCHTIME_ROOT/manifests/train.parquet \
+    --matchtime_root $MATCHTIME_ROOT \
+    --clip_dir       $MATCHTIME_ROOT/clips \
+    --workers        16
+```
+
+Run the same command with `valid.parquet` to prepare the eval clips.
+
+### 2.3 Generate the codec cache
+
+`scripts/build_soccer_cache/gen_codec.py` invokes the OneVision-2 codec
+processor on each clip and writes the canvases + patch-position tables under
+`--codec_dir`. `--patch` and `--max_pixels` MUST match the values wired into the
+trainer's cache-hit precheck (defaults match the shipped pipeline).
+
+```bash
+python scripts/build_soccer_cache/gen_codec.py \
+    --manifest       $MATCHTIME_ROOT/manifests/train.parquet \
+    --matchtime_root $MATCHTIME_ROOT \
+    --clip_dir       $MATCHTIME_ROOT/clips \
+    --codec_dir      $MATCHTIME_ROOT/codec_cache \
+    --codec_module   /path/to/LLaVA-OneVision-2 \
+    --workers        16
+```
+
+`--codec_module` points at any directory containing
+`codec_video_processing_llava_onevision2.py`; the OneVision-2 checkpoint dir
+works out of the box.
+
+## 3. Train
+
+Both stages share `ov_train/train.py`. The environment variables listed below
+tell the loader where clips, codec caches, and manifests live; they must be
+consistent with what was used at data-prep time.
+
+```bash
+export MATCHTIME_ROOT=/path/to/MatchTime
+export STREAMMIND_CLIP_CACHE=$MATCHTIME_ROOT/clips
+export ONLINE_CODEC_CACHE_DIR=$MATCHTIME_ROOT/codec_cache
+export SOCCER_MANIFEST_DIR=$MATCHTIME_ROOT/manifests
+```
+
+`scripts/volcano_entrypoint.sh` is the reference launcher; it selects Stage-1
+vs Stage-2 from `$STAGE` and passes the correct flags into `ov_train/train.py`.
+It runs `torchrun` on a single node and expects an OneVision-2 backbone via
+`$MODEL_PATH`.
+
+### 3.1 Stage 1 — generation
+
+Trains the projector + LLM on event-aligned commentary tokens under the causal
+"no future frame" constraint.
+
+```bash
+STAGE=1 VIDEO_BACKEND=codec \
+MODEL_PATH=/path/to/LLaVA-OneVision-2 \
+OUTPUT_DIR=./outputs/stage1 \
+LR=2e-5 \
+DEEPSPEED_CONFIG=scripts/zero2.json \
+bash scripts/volcano_entrypoint.sh
+```
+
+### 3.2 Stage 2 — event gate
+
+Loads the Stage-1 checkpoint and trains only the classification head that
+decides when the model should speak. Use the final Stage-1 checkpoint as
+`$RESUME_FROM`.
+
+```bash
+STAGE=2 VIDEO_BACKEND=codec \
+MODEL_PATH=/path/to/LLaVA-OneVision-2 \
+RESUME_FROM=./outputs/stage1/checkpoint-final \
+OUTPUT_DIR=./outputs/stage2 \
+LR=2e-5 \
+DEEPSPEED_CONFIG=scripts/zero2.json \
+bash scripts/volcano_entrypoint.sh
+```
+
+Set `WANDB_API_KEY` to stream metrics to Weights & Biases; otherwise the
+launcher falls back to `--report_to none`.
+
+## 4. Evaluate
+
+Both eval flavours share `ov_train/evaluate.py`. They reuse the same
+`LazySupervisedDataset` as training so the eval distribution matches what the
+model was trained on.
+
+### 4.1 Event-gate metrics (`--eval_type cls`)
+
+Reports the paper's TriggerAcc and TimeVal on the validation set:
+
+```bash
+python -m ov_train.evaluate \
+    --model_path   /path/to/LLaVA-OneVision-2 \
+    --resume_from  ./outputs/stage2/checkpoint-final \
+    --eval_type    cls \
+    --data_type    valid \
+    --tolerance_frames 2
+```
+
+### 4.2 Caption metrics (`--eval_type llm`)
+
+Dumps teacher-forced (pred, target) pairs into a CSV and reports PPL,
+Correctness, and Fluency:
+
+```bash
+python -m ov_train.evaluate \
+    --model_path   /path/to/LLaVA-OneVision-2 \
+    --resume_from  ./outputs/stage1/checkpoint-final \
+    --eval_type    llm \
+    --data_type    valid \
+    --caption_csv  ./outputs/stage1/eval_captions.csv
+```
+
+Once the CSV is dumped, compute BLEU/METEOR/ROUGE-L via the standalone scorer
+(requires `pycocoevalcap` and a JRE for METEOR):
+
+```bash
+pip install pycocoevalcap
+python -m ov_train.nlg_eval --csv ./outputs/stage1/eval_captions.csv
+```
+
+## 5. Citation
+
+If this repository is useful, please cite the original StreamMind paper this
+project builds upon:
+
 ```bibtex
 @article{ding2025streammind,
   title={StreamMind: Unlocking Full Frame Rate Streaming Video Dialogue through Event-Gated Cognition},
@@ -99,15 +199,10 @@ If you find StreamMind useful for your research and applications, please cite us
 }
 ```
 
-## 👍 Acknowledgement
-The codebase of StreamMind is adapted from [**VideoLLaMA 2**](https://github.com/DAMO-NLP-SG/VideoLLaMA2), We are also grateful for the following projects our StreamMind arise from:
-* [**Videollm-online**](https://github.com/showlab/videollm-online) [**LLaMA 2**](https://github.com/meta-llama/llama), [**Mistral-7B**](https://mistral.ai/news/announcing-mistral-7b/), [**OpenAI CLIP**](https://openai.com/index/clip/), [**Honeybee**](https://github.com/kakaobrain/honeybee).
-* [**Video-ChatGPT**](https://github.com/mbzuai-oryx/Video-ChatGPT), [**Video-LLaVA**](https://github.com/PKU-YuanGroup/Video-LLaVA). 
-* [**WebVid**](https://github.com/m-bain/webvid), [**Panda-70M**](https://github.com/snap-research/Panda-70M), [**LanguageBind**](https://github.com/PKU-YuanGroup/LanguageBind), [**InternVid**](https://github.com/OpenGVLab/InternVideo/tree/main/Data/InternVid).
-* [**VideoChat2**](https://github.com/OpenGVLab/Ask-Anything/tree/main/video_chat2), [**Valley**](https://github.com/RupertLuo/Valley), [**VTimeLLM**](https://github.com/huangb23/VTimeLLM), [**ShareGPT4V**](https://sharegpt4v.github.io/).
+## 6. Acknowledgement
 
-
-## 🔒 License
-
-This project is released under the Apache 2.0 license as found in the LICENSE file.
-The service is a research preview intended for **non-commercial use ONLY**, subject to the model Licenses of LLaMA and Mistral, Terms of Use of the data generated by OpenAI, and Privacy Practices of ShareGPT. Please get in touch with us if you find any potential violations.
+The event-gated streaming design, the two-stage generation / classifier
+recipe, and the reference dataloader all come from
+[**StreamMind**](https://github.com/xinding-sys/StreamMind). This repository
+adapts that framework onto an OneVision-2 backbone with a codec-based data
+pipeline.
