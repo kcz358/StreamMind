@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple, Union
 
+import os
+
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
 from torch.nn import CrossEntropyLoss
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ov_train.onevision_arch import OneVisionStreamMetaForCausalLM
@@ -77,7 +80,9 @@ class OneVisionStreamForCausalLM(nn.Module, OneVisionStreamMetaForCausalLM):
 
     def __init__(
         self,
-        model_name_or_path: str,
+        model_name_or_path: Optional[str] = None,
+        *,
+        config: Optional["AutoConfig"] = None,
         mm_hidden_size: Optional[int] = None,
         projector_hidden_size: Optional[int] = None,
         mm_projector_type: str = "mamba",
@@ -87,12 +92,23 @@ class OneVisionStreamForCausalLM(nn.Module, OneVisionStreamMetaForCausalLM):
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        ov_model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=True,
-            dtype=dtype,
-            attn_implementation=attn_implementation,
-        )
+        if config is not None:
+            ov_model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=True,
+                attn_implementation=attn_implementation,
+                dtype=dtype,
+            )
+        else:
+            if model_name_or_path is None:
+                raise ValueError("Provide either model_name_or_path or config")
+            ov_model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=True,
+                dtype=dtype,
+                attn_implementation=attn_implementation,
+            )
+        ov_model.to(dtype=dtype)
         self.config = ov_model.config
 
         if mm_hidden_size is None:
@@ -279,3 +295,41 @@ class OneVisionStreamForCausalLM(nn.Module, OneVisionStreamMetaForCausalLM):
         if kwargs.pop("llm_eval", None):
             return llm_output, labels
         return llm_output
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        weights_filename: str = "model.safetensors",
+        strict: bool = False,
+        **kwargs,
+    ) -> "OneVisionStreamForCausalLM":
+        """Load a StreamMind checkpoint from a local dir or HF repo.
+
+        Reads ``config.json`` from the checkpoint, builds the OV2 backbone
+        with random weights via :func:`AutoModelForCausalLM.from_config`,
+        then ``load_state_dict`` from ``model.safetensors`` in the same
+        location so no separate backbone repo is required.
+        """
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=True
+        )
+        model = cls(config=config, **kwargs)
+
+        if os.path.isdir(pretrained_model_name_or_path):
+            weights_path = os.path.join(pretrained_model_name_or_path, weights_filename)
+        else:
+            from huggingface_hub import hf_hub_download
+
+            weights_path = hf_hub_download(
+                repo_id=pretrained_model_name_or_path,
+                filename=weights_filename,
+            )
+
+        sd = load_file(weights_path)
+        missing, unexpected = model.load_state_dict(sd, strict=strict)
+        print(
+            f"[OneVisionStreamForCausalLM.from_pretrained] {weights_path}\n"
+            f"  missing={len(missing)} unexpected={len(unexpected)}"
+        )
+        return model
