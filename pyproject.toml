@@ -33,6 +33,7 @@ dependencies = [
     "scenedetect",
     "pytorch-lightning",
     "moviepy<2.0",
+    "codec-video-prep",
 ]
 
 [project.optional-dependencies]
