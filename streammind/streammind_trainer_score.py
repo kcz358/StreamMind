@@ -1171,7 +1171,11 @@ class StreamMindTrainer(Trainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        if hasattr(loss, "dim") and loss.dim() > 0:
+        import torch as _torch
+        if not isinstance(loss, _torch.Tensor):
+            print(f"[training_step] loss type={type(loss)}  repr={loss!r}", flush=True)
+        elif loss.dim() > 0:
+            print(f"[training_step] loss dim={loss.dim()} shape={tuple(loss.shape)}  will reduce", flush=True)
             loss = loss.mean()
 
         if getattr(self, "use_apex", False):
