@@ -1171,6 +1171,9 @@ class StreamMindTrainer(Trainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
+        if hasattr(loss, "dim") and loss.dim() > 0:
+            loss = loss.mean()
+
         if getattr(self, "use_apex", False):
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
