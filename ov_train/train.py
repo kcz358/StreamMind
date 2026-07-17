@@ -170,7 +170,7 @@ def main() -> None:
         data_collator=collator,
         processing_class=tokenizer,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
 
 if __name__ == "__main__":
