@@ -14,6 +14,7 @@ lazily from ``streammind_gate.safetensors`` only when this evaluator invokes
 """
 
 import argparse
+import json
 import os
 
 import torch
@@ -40,6 +41,7 @@ def parse_args():
     parser.add_argument("--model", default="Mage-VL/Mage-VL-Base")
     parser.add_argument("--data_type", default="valid")
     parser.add_argument("--tolerance_frames", type=int, default=2)
+    parser.add_argument("--output_dir", default="")
     return parser.parse_args()
 
 
@@ -80,6 +82,10 @@ def main():
 
     trigger_scores = []
     timval_scores = []
+    output_path = ""
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        output_path = os.path.join(args.output_dir, f"rank_{dist.get_rank():02d}.jsonl")
     for half, inputs in enumerate(loader, 1):
         if (half - 1) % dist.get_world_size() != dist.get_rank():
             continue
@@ -96,8 +102,20 @@ def main():
         ).cumsum(0).to(logits.device)
         labels = torch.zeros(len(logits), dtype=torch.long, device=logits.device)
         labels[boundaries - 1] = 1
+        probabilities = torch.softmax(logits.float(), dim=-1)[:, 1]
         predictions = logits.argmax(dim=-1)
         relaxed = relaxed_correct(labels, predictions, args.tolerance_frames)
+
+        if output_path:
+            record = {
+                "half": half - 1,
+                "tolerance": args.tolerance_frames,
+                "labels": labels.cpu().tolist(),
+                "predictions": predictions.cpu().tolist(),
+                "response_probabilities": probabilities.cpu().tolist(),
+            }
+            with open(output_path, "a") as file:
+                file.write(json.dumps(record) + "\n")
 
         trigger_scores.append(relaxed.float().mean())
         false_positives = (((labels == 0) & (predictions == 1)) & ~relaxed).sum()
