@@ -38,44 +38,81 @@ from multiprocessing import Pool
 from _manifest import env_default, iter_segments
 
 
-_CODEC_PROC = None
-_CODEC_CFG = None
 _CODEC_CACHE_DIR_FOR = None
+_RUN_CV_PREINFER = None
+_LOAD_CODEC_RESULT = None
+_MAYBE_WARN_SHORT_VIDEO = None
+_CODEC_CFG = None
+_CANONICAL_CLIP_DIR: str | None = None
+_LOCAL_CLIP_DIR: str | None = None
+import fcntl as _fcntl  # noqa: E402
+
+
+def _canonical_to_local(canonical: str) -> str:
+    if _LOCAL_CLIP_DIR is None or _CANONICAL_CLIP_DIR is None:
+        return canonical
+    rel = os.path.relpath(canonical, _CANONICAL_CLIP_DIR)
+    return os.path.join(_LOCAL_CLIP_DIR, rel)
 
 
 def _init_worker(codec_module_dir: str, codec_root: str,
-                 patch: int, max_pixels: int) -> None:
+                 patch: int, max_pixels: int,
+                 canonical_clip_dir: str,
+                 local_clip_dir: str | None) -> None:
     """Process-pool initializer; loads the codec processor once per worker."""
-    global _CODEC_PROC, _CODEC_CFG, _CODEC_CACHE_DIR_FOR
+    global _CODEC_CACHE_DIR_FOR, _RUN_CV_PREINFER, _LOAD_CODEC_RESULT
+    global _MAYBE_WARN_SHORT_VIDEO, _CODEC_CFG
+    global _CANONICAL_CLIP_DIR, _LOCAL_CLIP_DIR
     os.environ["ONLINE_CODEC_CACHE_DIR"] = codec_root
     sys.path.insert(0, codec_module_dir)
     from codec_video_processing_llava_onevision2 import (
-        CodecConfig, process_codec_video, _cache_dir_for,
+        CodecConfig, _cache_dir_for, _run_cv_preinfer,
+        _load_codec_result, _maybe_warn_short_video,
     )
-    _CODEC_PROC = process_codec_video
-    _CODEC_CFG = CodecConfig(patch=patch, max_pixels=max_pixels)
     _CODEC_CACHE_DIR_FOR = _cache_dir_for
+    _RUN_CV_PREINFER = _run_cv_preinfer
+    _LOAD_CODEC_RESULT = _load_codec_result
+    _MAYBE_WARN_SHORT_VIDEO = _maybe_warn_short_video
+    _CODEC_CFG = CodecConfig(patch=patch, max_pixels=max_pixels)
+    _CANONICAL_CLIP_DIR = canonical_clip_dir
+    _LOCAL_CLIP_DIR = local_clip_dir
 
 
 def _worker(job: tuple[str, str, float, float]) -> tuple[str, str]:
+    """Cache key uses the canonical clip path; IO reads from the local mirror."""
     _video_path, clip_path, _start, _duration = job
     try:
-        cdir = _CODEC_CACHE_DIR_FOR(clip_path, _CODEC_CFG)
-        meta = os.path.join(str(cdir), "meta.json")
-        positions = os.path.join(str(cdir), "src_patch_position.npy")
-        if os.path.exists(meta) and os.path.exists(positions):
-            return ("skip_exists", cdir.name)
+        out_dir = _CODEC_CACHE_DIR_FOR(clip_path, _CODEC_CFG)
+        meta = out_dir / "meta.json"
+        positions = out_dir / "src_patch_position.npy"
+        if meta.exists() and positions.exists():
+            return ("skip_exists", out_dir.name)
     except Exception as exc:
         return ("err", f"cachedir:{type(exc).__name__}:{str(exc)[:120]}")
 
-    if not os.path.exists(clip_path):
-        return ("skip_noclip", os.path.basename(clip_path))
+    read_path = _canonical_to_local(clip_path)
+    if not os.path.exists(read_path):
+        return ("skip_noclip", os.path.basename(read_path))
 
+    _MAYBE_WARN_SHORT_VIDEO(read_path, _CODEC_CFG)
+
+    _CODEC_CFG.cache_root.mkdir(parents=True, exist_ok=True)
+    lock_path = _CODEC_CFG.cache_root / f".{out_dir.name}.lock"
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        _CODEC_PROC(clip_path, _CODEC_CFG)
-        return ("ok", cdir.name)
-    except Exception as exc:
-        return ("err", f"{type(exc).__name__}:{str(exc)[:140]}")
+        _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+        if meta.exists() and positions.exists():
+            return ("skip_exists", out_dir.name)
+        try:
+            _RUN_CV_PREINFER(read_path, out_dir, _CODEC_CFG)
+            return ("ok", out_dir.name)
+        except Exception as exc:
+            return ("err", f"{type(exc).__name__}:{str(exc)[:140]}")
+    finally:
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -91,7 +128,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--clip_dir",
         default=env_default("STREAMMIND_CLIP_CACHE"),
-        help="Directory of cut MP4 subclips (output of cut_clips.py).",
+        help="Canonical clip dir (drives the codec cache key; MUST match trainer's STREAMMIND_CLIP_CACHE).",
+    )
+    p.add_argument(
+        "--local_clip_dir",
+        default=None,
+        help="Alternate dir where the mp4 files actually live (mirrors clip_dir layout); the codec key still uses clip_dir.",
     )
     p.add_argument(
         "--codec_dir",
@@ -148,7 +190,8 @@ def main() -> None:
     with Pool(
         args.workers,
         initializer=_init_worker,
-        initargs=(args.codec_module, args.codec_dir, args.patch, args.max_pixels),
+        initargs=(args.codec_module, args.codec_dir, args.patch, args.max_pixels,
+                  args.clip_dir, args.local_clip_dir),
         maxtasksperchild=200,
     ) as pool:
         for i, (status, info) in enumerate(pool.imap_unordered(_worker, jobs, chunksize=2), 1):
