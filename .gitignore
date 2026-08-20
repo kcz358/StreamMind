@@ -10,7 +10,6 @@ dist
 *.json
 *.jsonl
 log_dir*/
-temp*/
 
 # Data
 !**/alpaca-data-conversation.json
@@ -32,7 +31,8 @@ temp*/
 
 # Demo
 serve_images/
-temp/
+temp/mage_vl_streammind_release/
+temp/wds_samples/
 
 # # data folder
 # data/
